@@ -5,6 +5,7 @@ use anyhow::{Context, Result};
 use lopdf::{dictionary, Document, Object, ObjectId};
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
+use colored::Colorize;
 
 /// Assembles all binders described in binder_map.
 pub fn assemble_all(
@@ -30,10 +31,10 @@ pub fn assemble_all(
 
         match assemble_one(binder_name, files, Path::new(output_folder)) {
             Ok(output_path) => {
-                println!("  Written to: {}", output_path.display());
+                println!("{}", format!("  Written to: {}", output_path.display()).green());
             }
             Err(e) => {
-                println!("  ERROR: {}", e);
+                println!("{}", format!("  ERROR: {}", e).red());
                 run_log.skip(
                     binder_name,
                     crate::log::SkipReason::Unreadable(e.to_string()),

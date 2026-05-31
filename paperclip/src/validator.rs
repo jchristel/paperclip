@@ -4,6 +4,7 @@
 use anyhow::{Context, Result};
 use std::io::Write;
 use std::path::Path;
+use colored::Colorize;
 
 /// Validates the mapper CSV path and optionally creates the file.
 ///
@@ -21,7 +22,7 @@ pub fn resolve_mapper_path(path: &str) -> Result<bool> {
 
     if let Some(folder) = folder {
         if !folder.exists() {
-            println!("ERROR: Folder does not exist: {}", folder.display());
+            println!("{}", format!("ERROR: Folder does not exist: {}", folder.display()).red());
             return Ok(false);
         }
     }

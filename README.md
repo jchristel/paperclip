@@ -38,7 +38,9 @@ paperclip/
 | `lopdf` | PDF reading, writing, merging |
 | `csv` | Mapper CSV and log CSV read/write |
 | `regex` | Filename pattern matching |
+| `walkdir` | Recursive directory traversal (PDF discovery) |
 | `indicatif` | Progress bar during PDF classification |
+| `colored` | Colour-coded console UI output (errors red, warnings yellow, success green) |
 | `chrono` | Timestamps for log CSV and cover pages |
 | `anyhow` | Ergonomic error handling |
 | `serde_json` | JSON serialisation (ready for manifest) |
@@ -66,7 +68,7 @@ paperclip/
 
 ### Binder Command
 - [x] `paperclip binder` — runs from any directory
-- [x] Recursively discovers all PDFs from calling directory
+- [x] Recursively discovers all PDFs from calling directory (via `walkdir` flat iterator, not hand-rolled recursion)
 - [x] Graceful exit with message if no PDFs found
 - [x] Progress bar during classification (suitable for 2000+ files)
 - [x] Classifies each PDF as Regular, Existing Binder, or Unreadable
@@ -77,6 +79,7 @@ paperclip/
 - [x] Validates filenames against 5-part code structure
 - [x] Filters invalid filenames out of binder plan
 - [x] Writes skip log CSV to calling directory with timestamp
+- [x] Colour-coded console output via `colored` (errors red, warnings/skips yellow, success green)
 
 ### Filename Parser
 - [x] Validates 5-part alphanumeric dash-separated code block at start of filename
@@ -106,6 +109,35 @@ paperclip/
 - [x] Columns: `timestamp`, `filename`, `reason`
 - [x] Reasons: `invalid_filename_format`, `missing_revision`, `no_mapper_match`, `unreadable`
 - [x] Written to calling directory after each binder run
+
+### Console Output (Colour)
+Console UI is colour-coded with the `colored` crate. This covers *user-facing UI
+output only* — diagnostic logging is a separate concern (see To Do).
+
+Colour vocabulary (kept deliberately small and consistent):
+
+| Colour | Meaning | Example |
+|---|---|---|
+| Red | Errors and failures | folder missing, binder write failed |
+| Yellow | Warnings and skips | mapper file not found, file skipped |
+| Green | Success confirmations | binder written to disk |
+| Plain | Neutral UI | binder plan listing, `[y/N]` prompts, summaries |
+
+Usage pattern — import the trait per file, then colour the finished string:
+```rust
+use colored::Colorize;
+
+// Literal strings:
+println!("{}", "\nError: output folders do not exist:".red());
+
+// Interpolated strings — build with format! first, then colour the result.
+// (.red() consumes the literal before {} is filled, so format! must run first.)
+println!("{}", format!("  Written to: {}", output_path.display()).green());
+```
+
+Currently applied in `validator.rs` (folder-missing error), `binder.rs`
+(mapper-not-found warning, output-folder error, per-file skip), and
+`assembler.rs` (per-binder error, binder-written success).
 
 ---
 
@@ -162,6 +194,16 @@ When no mapper CSV is configured, offer to bind PDFs by folder:
 - Contains only PDFs directly inside that folder (not subfolders)
 - Subfolders each get their own binder
 - Currently stubbed with a `TODO` comment in `binder.rs`
+- Now that discovery uses `walkdir`, a depth-limited walk (`.max_depth(1)`) gives the
+  "this folder only, not subfolders" behaviour this feature needs
+
+#### Diagnostic Logging (`log` + `env_logger`)
+Console colouring (`colored`) currently handles *user-facing UI* only. Separate
+from that, diagnostic messages (e.g. "loaded N mapper rows", skip reasons, open
+failures) should move to the `log` facade with an `env_logger` backend, which
+level-codes output automatically (warn yellow, error red) and supports
+`--verbose`/`--quiet` without affecting the UI. Note: `indicatif-log-bridge` may
+be needed so log lines don't garble the live progress bar.
 
 #### Filename Pattern Validation
 Currently all filenames that pass the 5-part code check are considered valid.

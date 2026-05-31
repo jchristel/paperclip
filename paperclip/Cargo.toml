@@ -17,6 +17,8 @@ indicatif = "0.17"
 csv = "1"
 regex = "1"
 chrono = "0.4"
+walkdir = "2.5.0"
+colored = "2"
 
 [dependencies.windows]
 version = "0.58"

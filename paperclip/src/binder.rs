@@ -3,6 +3,8 @@
 use anyhow::Result;
 use indicatif::{ProgressBar, ProgressStyle};
 use std::path::{Path, PathBuf};
+use walkdir::WalkDir;
+use colored::Colorize;
 
 pub fn run() -> Result<()> {
     let current_dir = std::env::current_dir()?;
@@ -11,7 +13,7 @@ pub fn run() -> Result<()> {
     let pdfs = find_pdfs(&current_dir);
 
     if pdfs.is_empty() {
-        println!("No PDF files found. Nothing to do.");
+        println!("{}", "No PDF files found. Nothing to do.".yellow());
         return Ok(());
     }
 
@@ -99,7 +101,7 @@ pub fn run() -> Result<()> {
             let mapper_path = std::path::Path::new(path);
             if !mapper_path.exists() {
                 // Path is configured but file is gone
-                println!("\nWarning: Mapper file configured but not found at:");
+                println!("{}", "\nWarning: Mapper file configured but not found at:".yellow());
                 println!("  {}", path);
                 println!("Run `paperclip config set --mapper-path` to update it.");
                 handle_no_mapper(&regular_pdfs)?;
@@ -153,7 +155,7 @@ fn handle_mapper(mapper_path: &std::path::Path, regular_pdfs: &[PathBuf]) -> Res
     // --- Validate output folders before doing any work -------------------
     let missing_folders = crate::mapper::validate_output_folders(&rows);
     if !missing_folders.is_empty() {
-        println!("\nError: The following output folders do not exist:");
+        println!("{}", "\nError: The following output folders do not exist:".red());
         for folder in &missing_folders {
             println!("  {}", folder);
         }
@@ -202,7 +204,7 @@ fn handle_mapper(mapper_path: &std::path::Path, regular_pdfs: &[PathBuf]) -> Res
                     crate::log::SkipReason::MissingRevision
                 };
 
-                println!("  Skipping: {} — {}", stem, msg);
+                println!("{}", format!("  Skipping: {} — {}", stem, msg).yellow());
                 run_log.skip(filename, reason);
                 invalid_paths.insert(pdf);
             }
@@ -210,7 +212,7 @@ fn handle_mapper(mapper_path: &std::path::Path, regular_pdfs: &[PathBuf]) -> Res
     }
 
     if invalid_paths.is_empty() {
-        println!("  All filenames valid.");
+        println!("{}", "  All filenames valid.".green());
     }
 
     // --- Filter binder_map to remove invalid files -----------------------
@@ -264,35 +266,27 @@ fn handle_mapper(mapper_path: &std::path::Path, regular_pdfs: &[PathBuf]) -> Res
 
 /// Recursively finds all PDF files under the given folder.
 /// Returns a sorted list of absolute paths.
+///
+/// Uses the `walkdir` crate instead of a hand-rolled recursion. WalkDir flattens
+/// the whole tree into one iterator — the clean version of the "get the tree, then
+/// walk the list" idea. It's roughly:
+///   C#:     Directory.EnumerateFiles(root, "*", SearchOption.AllDirectories)
+///   Python: os.walk(root)
 fn find_pdfs(root: &Path) -> Vec<PathBuf> {
-    let mut results = Vec::new();
-    collect_pdfs(root, &mut results);
-    results.sort();
+    let mut results: Vec<PathBuf> = WalkDir::new(root)
+        .into_iter()                       // turn the WalkDir into an iterator of entries
+        .filter_map(|entry| entry.ok())    // skip any entry we couldn't read (permissions, etc.)
+                                           //   instead of crashing — like the old `match … Err => return`
+        .map(|entry| entry.into_path())    // DirEntry -> owned PathBuf
+        .filter(|path| {
+            // Keep only files whose extension is "pdf" (case-insensitive: .PDF .pdf .Pdf)
+            path.extension()
+                .and_then(|ext| ext.to_str())
+                .map(|ext| ext.eq_ignore_ascii_case("pdf"))
+                .unwrap_or(false)
+        })
+        .collect();                        // gather the matches into a Vec
+
+    results.sort();                        // keep the stable, filename-ascending order you had before
     results
-}
-
-/// Recursive helper — walks the directory tree and collects .pdf paths.
-/// This is the equivalent of Directory.GetFiles("*.pdf", SearchOption.AllDirectories) in C#.
-fn collect_pdfs(dir: &Path, results: &mut Vec<PathBuf>) {
-    // read_dir returns an iterator over directory entries
-    // we silently skip folders we can't read rather than crashing
-    let entries = match std::fs::read_dir(dir) {
-        Ok(e) => e,
-        Err(_) => return,
-    };
-
-    for entry in entries.flatten() {  // .flatten() silently skips any entries that errored
-        let path = entry.path();
-
-        if path.is_dir() {
-            // Recurse into subfolders
-            collect_pdfs(&path, results);
-        } else if path.extension()
-            .and_then(|e| e.to_str())
-            .map(|e| e.eq_ignore_ascii_case("pdf"))  // case-insensitive: .PDF .pdf .Pdf all match
-            .unwrap_or(false)
-        {
-            results.push(path);
-        }
-    }
 }
