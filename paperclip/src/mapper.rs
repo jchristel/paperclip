@@ -3,7 +3,7 @@
 
 use anyhow::{Context, Result, bail};
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 // --- Struct --------------------------------------------------------------
 
@@ -68,6 +68,72 @@ pub fn load(path: &Path) -> Result<Vec<MapperRow>> {
     Ok(rows)
 }
 
+// --- Matching ------------------------------------------------------------
+
+/// Matches a list of PDF paths against mapper rows.
+/// Returns:
+///   - A map of binder_name -> list of matching PDF paths
+///   - A list of PDFs that matched no rows (unmatched)
+pub fn match_pdfs<'a>(
+    pdfs: &'a [PathBuf],
+    rows: &'a [MapperRow],
+) -> (HashMap<String, Vec<&'a PathBuf>>, Vec<&'a PathBuf>) {
+    // HashMap<binder_name, Vec<pdf_path>>
+    // like Dictionary<string, List<string>> in C#
+    let mut binder_map: HashMap<String, Vec<&PathBuf>> = HashMap::new();
+    let mut unmatched: Vec<&PathBuf> = Vec::new();
+
+    for pdf in pdfs {
+        // Get just the filename without the folder path
+        // e.g. "C:\docs\20251123_drawing.pdf" -> "20251123_drawing.pdf"
+        let filename = match pdf.file_name().and_then(|n| n.to_str()) {
+            Some(n) => n,
+            None => {
+                unmatched.push(pdf);
+                continue;  // like `continue` in C# — skip to next iteration
+            }
+        };
+
+        let mut matched_any = false;
+
+        for row in rows {
+            // starts_with is case-sensitive — adjust if needed later
+            if filename.starts_with(&row.prefix) {
+                binder_map
+                    .entry(row.binder_name.clone())  // get or create the Vec for this binder
+                    .or_insert_with(Vec::new)         // like GetOrAdd in C# ConcurrentDictionary
+                    .push(pdf);
+                matched_any = true;
+            }
+        }
+
+        if !matched_any {
+            unmatched.push(pdf);
+        }
+    }
+
+    (binder_map, unmatched)
+}
+
+/// Checks that all output folders referenced in the mapper rows exist on disk.
+/// Returns a list of missing folders — empty means all good.
+/// Called before assembly begins so we fail early rather than mid-run.
+pub fn validate_output_folders(rows: &[MapperRow]) -> Vec<String> {
+    use std::collections::HashSet;
+
+    // Deduplicate first — multiple rows may share the same output folder
+    // HashSet is like HashSet<T> in C#
+    let unique_folders: HashSet<&String> = rows.iter()
+        .map(|r| &r.output_folder)
+        .collect();
+
+    unique_folders
+        .into_iter()
+        .filter(|folder| !std::path::Path::new(folder).exists())
+        .map(|folder| folder.clone())
+        .collect()
+}
+
 // --- Helper --------------------------------------------------------------
 
 /// Extracts a field by column name from a CSV record.
@@ -89,4 +155,18 @@ fn get_field(
         .with_context(|| format!("Row {}: missing value for column '{}'", row_num, column))?;
 
     Ok(value.trim().to_string())
+}
+
+/// Validates a PDF filename against a project-specific pattern.
+///
+/// TODO: Filename validation is not yet implemented.
+/// When implemented, this should support:
+///   - Multiple configurable patterns (e.g. 5-part code, free-form, none)
+///   - Pattern defined per binder, not per row
+///   - Skipping validation entirely when no pattern is specified
+///   - Logging skipped files to the CSV log with reason "invalid_filename_format"
+///
+/// For now all filenames are considered valid.
+pub fn validate_filename(_filename: &str, _pattern: Option<&str>) -> bool {
+    true
 }

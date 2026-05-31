@@ -5,6 +5,10 @@ mod validator;
 mod binder;
 mod pdf_classifier;
 mod mapper;
+mod filename_parser;
+mod log;
+mod cover_page;
+mod assembler;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};

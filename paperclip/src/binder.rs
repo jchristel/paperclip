@@ -144,13 +144,120 @@ fn handle_no_mapper(regular_pdfs: &[PathBuf]) -> Result<()> {
 
 /// Called when a mapper file is present.
 /// Reads and validates the CSV.
-fn handle_mapper(mapper_path: &std::path::Path, _regular_pdfs: &[PathBuf]) -> Result<()> {
+fn handle_mapper(mapper_path: &std::path::Path, regular_pdfs: &[PathBuf]) -> Result<()> {
     println!("\nMapper file found: {}", mapper_path.display());
 
     let rows = crate::mapper::load(mapper_path)?;
     println!("Loaded {} mapper row(s).", rows.len());
 
-    // TODO: match PDFs against mapper rows and build binders
+    // --- Validate output folders before doing any work -------------------
+    let missing_folders = crate::mapper::validate_output_folders(&rows);
+    if !missing_folders.is_empty() {
+        println!("\nError: The following output folders do not exist:");
+        for folder in &missing_folders {
+            println!("  {}", folder);
+        }
+        println!("Please create them or update the mapper CSV.");
+        return Ok(());
+    }
+
+    // --- Create the run log ----------------------------------------------
+    // Log goes to the current directory (where the user called paperclip from)
+    let current_dir = std::env::current_dir()?;
+    let mut run_log = crate::log::RunLog::new(&current_dir);
+
+    // --- Match PDFs against mapper rows ----------------------------------
+    let (binder_map, unmatched) = crate::mapper::match_pdfs(regular_pdfs, &rows);
+
+    // Record unmatched files in the log
+    for pdf in &unmatched {
+        let filename = pdf.file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("unknown");
+        run_log.skip(filename, crate::log::SkipReason::NoMapperMatch);
+    }
+
+    // --- Parse filenames and report invalid ones -------------------------
+    println!("\nValidating filenames...");
+    // Collect invalid paths into a HashSet for fast lookup during filtering
+    let mut invalid_paths: std::collections::HashSet<&PathBuf> = std::collections::HashSet::new();
+
+    for pdf in regular_pdfs {
+        let stem = pdf.file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("");
+
+        match crate::filename_parser::parse(stem) {
+            Ok(_) => {}
+            Err(e) => {
+                let msg = e.to_string();
+                let filename = pdf.file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("unknown");
+
+                // Pick the right skip reason based on the error message
+                let reason = if msg.contains("5-part") {
+                    crate::log::SkipReason::InvalidFilenameFormat
+                } else {
+                    crate::log::SkipReason::MissingRevision
+                };
+
+                println!("  Skipping: {} — {}", stem, msg);
+                run_log.skip(filename, reason);
+                invalid_paths.insert(pdf);
+            }
+        }
+    }
+
+    if invalid_paths.is_empty() {
+        println!("  All filenames valid.");
+    }
+
+    // --- Filter binder_map to remove invalid files -----------------------
+    // Retain only files that are NOT in the invalid set
+    let filtered_binder_map: std::collections::HashMap<&String, Vec<&&PathBuf>> = binder_map
+        .iter()
+        .map(|(binder_name, files)| {
+            let valid_files: Vec<&&PathBuf> = files
+                .iter()
+                .filter(|f| !invalid_paths.contains(*f))
+                .collect();
+            (binder_name, valid_files)
+        })
+        .filter(|(_, files)| !files.is_empty())  // drop binders with no valid files left
+        .collect();
+
+    // --- Print binder plan -----------------------------------------------
+    println!("\nBinders to assemble:");
+    if filtered_binder_map.is_empty() {
+        println!("  (none — no valid PDFs matched any mapper row)");
+    } else {
+        let mut binder_names: Vec<&&String> = filtered_binder_map.keys().collect();
+        binder_names.sort();
+
+        for name in binder_names {
+            let files = &filtered_binder_map[name];
+            println!("  {} ({} file(s)):", name, files.len());
+            for f in files {
+                println!("    {}", f.file_name().unwrap_or_default().to_str().unwrap_or("?"));
+            }
+        }
+    }
+
+    if !unmatched.is_empty() {
+        println!("\nUnmatched PDFs (no mapper row covers these):");
+        for f in &unmatched {
+            println!("  {}", f.file_name().unwrap_or_default().to_str().unwrap_or("?"));
+        }
+    }
+
+    // --- Assemble binders ------------------------------------------------
+    if !filtered_binder_map.is_empty() {
+        crate::assembler::assemble_all(&filtered_binder_map, &rows, &mut run_log)?;
+    }
+
+    // --- Write log -------------------------------------------------------
+    run_log.write()?;
 
     Ok(())
 }
