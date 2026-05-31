@@ -1,6 +1,10 @@
 // src/main.rs
 
 mod settings;
+mod validator;
+mod binder;
+mod pdf_classifier;
+mod mapper;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
@@ -19,6 +23,8 @@ enum Commands {
         #[command(subcommand)]
         action: ConfigAction,
     },
+    /// Assemble PDFs into binders
+    Binder,
 }
 
 #[derive(Subcommand)]
@@ -73,18 +79,30 @@ fn main() -> Result<()> {
 
             ConfigAction::Set { username, user_id, mapper_path, password } => {
                 let mut config = settings::load()?;
+                let mut changed = false;  // track whether anything was actually updated
 
                 if let Some(v) = username {
                     config.username = Some(v);
+                    changed = true;
                 }
                 if let Some(v) = user_id {
                     config.user_id = Some(v);
+                    changed = true;
                 }
-                if let Some(v) = mapper_path {
-                    config.mapper_csv_path = Some(v);
+                if let Some(ref v) = mapper_path {
+                    if validator::resolve_mapper_path(v)? {
+                        config.mapper_csv_path = Some(v.clone());
+                        changed = true;
+                    }
                 }
 
-                settings::save(&config)?;
+                if changed {
+                    settings::save(&config)?;
+                    println!("Settings saved.");
+                } else if !password {
+                    // Nothing was passed or everything was rejected
+                    println!("No settings were updated.");
+                }
 
                 // password is now a bool — true means the user passed --password
                 // rpassword::prompt_password prints the prompt but hides the keystrokes,
@@ -100,9 +118,10 @@ fn main() -> Result<()> {
                         println!("Password saved to Credential Manager.");
                     }
                 }
-
-                println!("Settings saved.");
             }
+        },
+        Commands::Binder => {
+            binder::run()?;
         }
     }
 
