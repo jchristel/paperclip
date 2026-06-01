@@ -12,15 +12,18 @@ mapper CSV file. Built in Rust, installable per-user without admin rights.
 ```
 paperclip/
 ├── main.rs               # Entry point, CLI argument parsing (clap)
+├── console.rs            # Enables ANSI colour output on Windows consoles
 ├── settings.rs           # Config file (TOML) + Windows Credential Manager
 ├── validator.rs          # Input validation (mapper path check, file creation prompt)
 ├── binder.rs             # Binder command entry point, PDF discovery, orchestration
-├── pdf_classifier.rs     # Classifies PDFs as Regular / Binder / Unreadable
+├── pdf_classifier.rs     # Classifies PDFs as Regular / Binder / Unreadable / TooLarge
 ├── mapper.rs             # Mapper CSV load, validate, match PDFs to binders
-├── filename_parser.rs    # Validates filenames, extracts revision and name
-├── cover_page.rs         # Generates cover pages using lopdf
-├── assembler.rs          # Assembles binder PDFs from cover pages + source PDFs
-├── log.rs                # Writes skip log CSV
+├── filename_parser.rs    # Strict + lenient filename parsing (code, revision, name)
+├── manifest.rs           # Binder manifest data model + JSON (serde)
+├── xmp.rs                # Wraps manifest as compressed XMP, attaches to / reads from PDF
+├── assembler.rs          # Merges source PDFs into a binder + embeds manifest
+├── inspect.rs            # Reads & prints a binder's manifest; rename detection
+├── log.rs                # Writes skip/flag log CSV
 └── install.ps1           # Per-user PowerShell installer (no admin required)
 ```
 
@@ -40,11 +43,12 @@ paperclip/
 | `regex` | Filename pattern matching |
 | `walkdir` | Recursive directory traversal (PDF discovery) |
 | `indicatif` | Progress bar during PDF classification |
-| `colored` | Colour-coded console UI output (errors red, warnings yellow, success green) |
-| `chrono` | Timestamps for log CSV and cover pages |
+| `chrono` | Timestamps for log CSV and manifest |
 | `anyhow` | Ergonomic error handling |
-| `serde_json` | JSON serialisation (ready for manifest) |
-| `uuid` | Binder UUID generation (ready for manifest) |
+| `serde_json` | Manifest JSON serialisation |
+| `uuid` | Binder UUID generation (`binder_id`) |
+| `flate2` | Deflate compression for the XMP manifest stream |
+| `colored` | Coloured terminal output (flags, errors) |
 
 ---
 
@@ -72,17 +76,18 @@ paperclip/
 - [x] Graceful exit with message if no PDFs found
 - [x] Progress bar during classification (suitable for 2000+ files)
 - [x] Classifies each PDF as Regular, Existing Binder, or Unreadable
+- [x] Skips oversized PDFs (>500 MiB) by file-size check *before* parsing, so a single huge file can no longer exhaust memory/CPU and freeze the machine (size limit is a tunable constant in `pdf_classifier.rs`)
 - [x] Loads mapper CSV path from settings
 - [x] Validates all output folders exist before starting
 - [x] Matches PDFs to binders by filename prefix
 - [x] Reports unmatched PDFs
-- [x] Validates filenames against 5-part code structure
-- [x] Filters invalid filenames out of binder plan
-- [x] Writes skip log CSV to calling directory with timestamp
-- [x] Colour-coded console output via `colored` (errors red, warnings/skips yellow, success green)
+- [x] Parses filenames (lenient) and flags any that don't match the naming style
+- [x] Flagged files are KEPT in the binder, not skipped — the flag is recorded in both the log CSV and the embedded manifest
+- [x] Writes skip/flag log CSV to calling directory with timestamp
 
 ### Filename Parser
-- [x] Validates 5-part alphanumeric dash-separated code block at start of filename
+- [x] `parse` (strict): validates 5-part alphanumeric dash-separated code block at start
+- [x] `parse_lenient` (best-effort): never fails; extracts whatever it can and returns a `flag_reason` describing what's missing — used by the binder run so bad names are flagged, not rejected
 - [x] Extracts revision from `()` or `[]` brackets
 - [x] Extracts optional human-readable name between code and revision
 
@@ -91,102 +96,53 @@ paperclip/
 - [x] Detects conflicting output folders for the same binder name (aborts)
 - [x] Detects empty CSV (aborts with message)
 
-### Cover Page
-- [x] Generated using `lopdf` directly (no external font files)
-- [x] Fields: File Name, Revision, Start Page, End Page, Date/Time
-- [x] A4 portrait, Helvetica regular and bold, divider line
+### Binder Manifest (XMP)
+- [x] Full manifest serialised to JSON, wrapped as an XMP packet, deflate-compressed (`flate2`), and attached to the document catalog as a `/Metadata` stream
+- [x] `BinderTool` marker kept in the Info dict as a fast "is this a binder?" check (classification reads this, not the manifest)
+- [x] Manifest fields: `tool`, `schema_version`, `binder_id` (UUID, survives renaming), `binder_name`, `created_utc`, `mapper_rows`, and per-file `files`
+- [x] Each `FileEntry`: `filename`, `code`, `revision`, `name`, `start_page`, `end_page`, `added_utc`, `flag_reason` (optional fields are `Option<String>`, omitted from JSON when absent)
+- [x] Read side (`xmp::read_manifest_json` + `manifest::from_json`) recovers the manifest from a binder
+
+### Inspect Command
+- [x] `paperclip inspect <file.pdf>` — reads and pretty-prints a binder's manifest
+- [x] Reports cleanly when a PDF has no manifest (regular PDF / pre-manifest binder)
+- [x] Rename detection: warns when the on-disk filename differs from the manifest's `binder_name`, citing the stable `binder_id`
 
 ### Assembler
 - [x] Sorts files by filename ascending within each binder
-- [x] Generates cover page per source PDF
-- [x] Merges cover pages and source PDF pages into single binder document
+- [x] Merges source PDF pages into a single binder document (no cover pages; page ranges have no offset)
+- [x] Records each file's page range in the manifest as it merges
 - [x] Writes binder PDF to output folder defined in mapper CSV
-- [x] Embeds `BinderTool` and `BinderName` keys in PDF Info dictionary
-- [x] Future runs correctly identify assembled binders and skip them
+- [x] Embeds `BinderTool` / `BinderName` keys in the Info dict AND the full compressed XMP manifest
+- [x] Future runs correctly identify assembled binders (via the Info-dict marker) and skip them
 
 ### Log CSV
 - [x] Timestamped filename: `paperclip_log_YYYYMMDD_HHMMSS.csv`
 - [x] Columns: `timestamp`, `filename`, `reason`
-- [x] Reasons: `invalid_filename_format`, `missing_revision`, `no_mapper_match`, `unreadable`
+- [x] Reasons: `flagged: <detail>` (kept, not skipped), `no_mapper_match`, `unreadable`, `too_large`
+- [x] Legacy reasons `invalid_filename_format` / `missing_revision` still defined but no longer emitted (superseded by `flagged`); retained for the future per-binder pattern check
 - [x] Written to calling directory after each binder run
-
-### Console Output (Colour)
-Console UI is colour-coded with the `colored` crate. This covers *user-facing UI
-output only* — diagnostic logging is a separate concern (see To Do).
-
-Colour vocabulary (kept deliberately small and consistent):
-
-| Colour | Meaning | Example |
-|---|---|---|
-| Red | Errors and failures | folder missing, binder write failed |
-| Yellow | Warnings and skips | mapper file not found, file skipped |
-| Green | Success confirmations | binder written to disk |
-| Plain | Neutral UI | binder plan listing, `[y/N]` prompts, summaries |
-
-Usage pattern — import the trait per file, then colour the finished string:
-```rust
-use colored::Colorize;
-
-// Literal strings:
-println!("{}", "\nError: output folders do not exist:".red());
-
-// Interpolated strings — build with format! first, then colour the result.
-// (.red() consumes the literal before {} is filled, so format! must run first.)
-println!("{}", format!("  Written to: {}", output_path.display()).green());
-```
-
-Currently applied in `validator.rs` (folder-missing error), `binder.rs`
-(mapper-not-found warning, output-folder error, per-file skip), and
-`assembler.rs` (per-binder error, binder-written success).
 
 ---
 
 ## What Is Still To Do
 
-### High Priority
-
-#### Binder Metadata — XMP Stream (next session)
-The current implementation stores only two keys in the PDF Info dictionary:
-```
-BinderTool = "paperclip/1"
-BinderName = "test"
-```
-This needs to be replaced with a full manifest stored as a **compressed XMP stream**
-on the document catalog. The Info dict is deprecated and unsuitable for large binders
-(up to ~700 files = ~100KB uncompressed JSON).
-
-The full manifest struct to implement:
-```rust
-struct FileEntry {
-    filename: String,
-    revision: String,
-    start_page: u32,
-    end_page: u32,
-    added_utc: String,
-}
-
-struct BinderManifest {
-    tool: String,
-    schema_version: u32,
-    binder_id: String,       // UUID — survives renaming
-    binder_name: String,
-    created_utc: String,
-    mapper_rows: Vec<MapperRow>,
-    files: Vec<FileEntry>,
-}
-```
-
-The `BinderTool` marker key should remain in the Info dict as a fast identification
-check, but the full manifest moves to XMP.
-
-#### Rename Detection
-Once the manifest is in place, detect when a binder has been renamed on disk
-and warn the user:
-```
-Warning: file is named 'old_name' but was generated as 'test' (binder_id abc-123)
-```
+### Recently Completed (this session)
+- XMP manifest: per-document cover pages removed; full manifest now stored as a
+  compressed XMP stream on the catalog. `BinderTool` marker retained in the Info
+  dict for fast classification.
+- Flag-but-keep: filenames that don't match the naming style are flagged in the
+  log and manifest but kept in the binder rather than skipped.
+- `paperclip inspect` command + rename detection (manifest `binder_name` vs file
+  stem, anchored by `binder_id`).
 
 ### Medium Priority
+
+#### Existing-Binder Overwrite
+A `binder` run writes `{binder_name}.pdf` to the mapper's output folder. When the
+input directory and output folder are the same (common in testing), each run
+overwrites the previous binder. Decide on behaviour: refresh in place, version,
+or refuse when a binder already exists at the target path.
 
 #### Folder-based Binding (no mapper)
 When no mapper CSV is configured, offer to bind PDFs by folder:
@@ -196,14 +152,6 @@ When no mapper CSV is configured, offer to bind PDFs by folder:
 - Currently stubbed with a `TODO` comment in `binder.rs`
 - Now that discovery uses `walkdir`, a depth-limited walk (`.max_depth(1)`) gives the
   "this folder only, not subfolders" behaviour this feature needs
-
-#### Diagnostic Logging (`log` + `env_logger`)
-Console colouring (`colored`) currently handles *user-facing UI* only. Separate
-from that, diagnostic messages (e.g. "loaded N mapper rows", skip reasons, open
-failures) should move to the `log` facade with an `env_logger` backend, which
-level-codes output automatically (warn yellow, error red) and supports
-`--verbose`/`--quiet` without affecting the UI. Note: `indicatif-log-bridge` may
-be needed so log lines don't garble the live progress bar.
 
 #### Filename Pattern Validation
 Currently all filenames that pass the 5-part code check are considered valid.
@@ -230,11 +178,20 @@ HTTP client using `reqwest` crate. Credentials are already stored
 
 ### Known Limitations / Technical Debt
 
-- Cover page decision pending team review — may be removed or made optional
-- `serde_json` and `uuid` crates are in `Cargo.toml` but not yet used
-  (added in preparation for the XMP manifest work)
+- Cover pages have been removed entirely in favour of the XMP manifest. If a
+  human-readable contents page is wanted later, it would be a separate feature.
 - Filename pattern validation is a stub returning `true` for all files
 - Folder-based binding path prompts the user but does nothing
+- The manifest embeds JSON inside a custom XMP element and recovers it by
+  tag-slicing — pragmatic and valid as an XMP packet, but not modelled as
+  strict RDF properties (fine for paperclip's own round-trip)
+- Colour output relies on the terminal honouring ANSI; old `cmd.exe` may not,
+  in which case escape codes print literally (cosmetic only)
+- Oversized-PDF guard is a coarse file-size ceiling (default 500 MiB), not a
+  true streaming/lazy parse — legitimately large PDFs are skipped wholesale
+  rather than processed. The same guard should be reused on the binder-read
+  path (a merged binder of a large source is itself large). A real fix would
+  read only the trailer/Info dict without a full `Document::load`.
 
 ---
 
@@ -247,6 +204,7 @@ paperclip config set --user-id <value>
 paperclip config set --mapper-path <path>
 paperclip config set --password          # prompts securely, no echo
 paperclip binder                         # run from folder containing PDFs
+paperclip inspect <file.pdf>             # print a binder's manifest + rename check
 paperclip --help
 paperclip config --help
 paperclip config set --help
@@ -261,5 +219,6 @@ paperclip config set --help
 | Config file | `%APPDATA%\paper_clip\config.toml` |
 | Password | Windows Credential Manager as `paper_clip/aconex_password` |
 | Install folder | `%LOCALAPPDATA%\paperclip` (default) |
-| Skip log | Calling directory, timestamped |
+| Skip/flag log | Calling directory, timestamped |
 | Binder output | Per `output_folder` column in mapper CSV |
+| Binder manifest | Embedded in each binder PDF (compressed XMP `/Metadata` stream) |

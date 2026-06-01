@@ -28,6 +28,14 @@ pub enum SkipReason {
     Unreadable(String),
     /// File matched no mapper rows
     NoMapperMatch,
+    /// File exceeds the size limit and was skipped without parsing.
+    /// Carries the size in bytes so the log shows how big it was.
+    TooLarge(u64),
+    /// File did not match the naming convention but was KEPT in the binder.
+    /// Carries the full reason text (same string stored in the manifest), so
+    /// the CSV records exactly why — including when more than one thing was
+    /// wrong, e.g. "missing 5-part code; missing revision".
+    Flagged(String),
 }
 
 impl SkipReason {
@@ -39,6 +47,11 @@ impl SkipReason {
             SkipReason::MissingRevision       => "missing_revision".to_string(),
             SkipReason::Unreadable(msg)       => format!("unreadable: {}", msg),
             SkipReason::NoMapperMatch         => "no_mapper_match".to_string(),
+            // Show the size in MB for a human-readable log entry.
+            // Integer division by (1024*1024) converts bytes -> MiB.
+            SkipReason::TooLarge(bytes)       => format!("too_large: {} MB", bytes / (1024 * 1024)),
+            // Prefix so the CSV distinguishes "kept but odd" from real skips.
+            SkipReason::Flagged(reason)       => format!("flagged: {}", reason),
         }
     }
 }

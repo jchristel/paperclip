@@ -1,5 +1,7 @@
 // src/assembler.rs
-// Assembles source PDFs and cover pages into a single binder PDF.
+// Merges source PDFs into a single binder PDF and attaches an XMP manifest
+// describing its contents. (Per-document cover pages were removed in favour
+// of the embedded manifest.)
 
 use anyhow::{Context, Result};
 use lopdf::{dictionary, Document, Object, ObjectId};
@@ -29,7 +31,20 @@ pub fn assemble_all(
 
         println!("\nAssembling binder: {}", binder_name);
 
-        match assemble_one(binder_name, files, Path::new(output_folder)) {
+        // Collect just the mapper rows that belong to THIS binder, so the
+        // manifest records only the rows that drove it (not every row in the
+        // CSV). `binder_name` here is `&&String`, hence the double deref.
+        let binder_rows: Vec<crate::manifest::MapperRow> = rows
+            .iter()
+            .filter(|r| r.binder_name == **binder_name)
+            .map(|r| crate::manifest::MapperRow {
+                prefix: r.prefix.clone(),
+                binder_name: r.binder_name.clone(),
+                output_folder: r.output_folder.clone(),
+            })
+            .collect();
+
+        match assemble_one(binder_name, files, Path::new(output_folder), binder_rows) {
             Ok(output_path) => {
                 println!("{}", format!("  Written to: {}", output_path.display()).green());
             }
@@ -47,10 +62,13 @@ pub fn assemble_all(
 }
 
 /// Assembles a single binder PDF from a list of source files.
+/// `mapper_rows` are the rows that drove this binder; they're recorded in
+/// the embedded manifest so the binder is self-describing.
 fn assemble_one(
     binder_name: &str,
     files: &[&&PathBuf],
     output_folder: &Path,
+    mapper_rows: Vec<crate::manifest::MapperRow>,
 ) -> Result<PathBuf> {
     // Sort files by filename ascending
     let mut sorted_files = files.to_vec();
@@ -61,8 +79,14 @@ fn assemble_one(
             .to_string()
     });
 
-    // Collect all documents to merge — cover page + source PDF per file
+    // Collect the source documents to merge (no cover pages anymore — the
+    // binder is just the merged source pages) and, in parallel, build one
+    // manifest FileEntry per file describing where it landed.
     let mut documents: Vec<Document> = Vec::new();
+    let mut file_entries: Vec<crate::manifest::FileEntry> = Vec::new();
+
+    // 1-based running page counter. With no cover pages, the first file's
+    // content starts at page 1 — no +1 offset anywhere now.
     let mut current_page = 1u32;
 
     for file in &sorted_files {
@@ -74,37 +98,47 @@ fn assemble_one(
             .and_then(|s| s.to_str())
             .unwrap_or("");
 
-        let parsed = crate::filename_parser::parse(stem)
-            .context("Filename parse failed during assembly")?;
+        // Lenient parse: never fails. Pulls out whatever it can and reports a
+        // flag_reason for anything missing. Files are KEPT regardless now.
+        let parsed = crate::filename_parser::parse_lenient(stem);
 
         let source_doc = Document::load(file.as_path())
             .with_context(|| format!("Failed to open: {}", filename))?;
 
         let source_page_count = source_doc.get_pages().len() as u32;
-        let start_page = current_page + 1; // +1 for cover page
+        let start_page = current_page;
         let end_page   = start_page + source_page_count - 1;
 
-        println!(
-            "  Adding: {} (rev {}, pages {}–{})",
-            filename, parsed.revision, start_page, end_page
-        );
+        // For display, fall back to "?" when revision is absent.
+        let rev_display = parsed.revision.as_deref().unwrap_or("?");
+        if let Some(reason) = &parsed.flag_reason {
+            println!(
+                "  Adding: {} (rev {}, pages {}–{}) [flagged: {}]",
+                filename, rev_display, start_page, end_page, reason
+            );
+        } else {
+            println!(
+                "  Adding: {} (rev {}, pages {}–{})",
+                filename, rev_display, start_page, end_page
+            );
+        }
 
-        // Generate cover page
-        let datetime = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
-        let cover_data = crate::cover_page::CoverPageData {
-            filename,
-            revision:   &parsed.revision,
+        // Record this file in the manifest. Option fields carry through
+        // directly: None where the parser couldn't extract a value.
+        file_entries.push(crate::manifest::FileEntry {
+            filename: filename.to_string(),
+            code: parsed.code.clone(),
+            revision: parsed.revision.clone(),
+            name: parsed.name.clone(),
             start_page,
             end_page,
-            datetime:   &datetime,
-        };
-        let cover_doc = crate::cover_page::generate(&cover_data)
-            .context("Failed to generate cover page")?;
+            added_utc: chrono::Utc::now().to_rfc3339(),
+            flag_reason: parsed.flag_reason.clone(),
+        });
 
-        documents.push(cover_doc);
         documents.push(source_doc);
 
-        current_page += 1 + source_page_count;
+        current_page += source_page_count;
     }
 
     // --- Merge all documents using the lopdf pattern from the docs -------
@@ -200,8 +234,20 @@ fn assemble_one(
     binder_doc.renumber_objects();
     binder_doc.adjust_zero_pages();
 
-    // --- Embed BinderTool marker -----------------------------------------
+    // --- Embed the fast-ID marker in the Info dict -----------------------
+    // The full data lives in the XMP manifest below; this Info-dict marker
+    // stays as a cheap "is this one of ours?" check for the classifier.
     embed_marker(&mut binder_doc, binder_name);
+
+    // --- Build and attach the XMP manifest -------------------------------
+    let manifest = crate::manifest::BinderManifest::new(
+        binder_name,
+        mapper_rows,
+        file_entries,
+    );
+    let manifest_json = manifest.to_json()?;
+    crate::xmp::attach_manifest(&mut binder_doc, &manifest_json)
+        .context("Failed to attach manifest to binder")?;
 
     // --- Write to disk ---------------------------------------------------
     let output_path = output_folder.join(format!("{}.pdf", binder_name));

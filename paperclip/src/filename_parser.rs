@@ -89,3 +89,100 @@ pub fn parse(filename_stem: &str) -> Result<ParsedFilename> {
 
     Ok(ParsedFilename { code, name, revision })
 }
+
+// --- Lenient (best-effort) parse -----------------------------------------
+
+/// The best-effort result of parsing a filename.
+///
+/// Unlike `ParsedFilename`, every field here is optional, because this parse
+/// never fails — it extracts whatever it can and reports problems instead of
+/// rejecting the file. This is what the binder uses now that files with bad
+/// names are KEPT and flagged rather than skipped.
+///
+/// Think of `Option<String>` as C#'s `string?`: `Some(x)` is a value,
+/// `None` is "not present".
+#[derive(Debug)]
+pub struct LenientParse {
+    /// The 5-part code block, if it was found at the start. None if missing.
+    pub code: Option<String>,
+    /// The human-readable name portion, if any.
+    pub name: Option<String>,
+    /// The revision from brackets, if found. None if missing.
+    pub revision: Option<String>,
+    /// None  = filename fully valid (nothing to flag).
+    /// Some(msg) = what was wrong. This string is written to both the CSV log
+    /// and the XMP manifest, so it should read as a short human explanation.
+    pub flag_reason: Option<String>,
+}
+
+/// Parses a filename stem and extracts whatever it can WITHOUT failing.
+///
+/// This is the counterpart to `parse`. Where `parse` returns `Err` on the
+/// first problem (it's a gate), this returns a `LenientParse` that always
+/// succeeds (it's a reporter). Missing pieces come back as `None`, and the
+/// reason(s) they're missing are collected into `flag_reason`.
+///
+/// Note there is no `Result` here — the return type is the struct directly,
+/// because this function genuinely cannot fail.
+pub fn parse_lenient(filename_stem: &str) -> LenientParse {
+    // Same two patterns as `parse`. Compiling them here keeps this function
+    // self-contained; if this ever runs in a hot loop we'd lift them out.
+    let code_re = Regex::new(r"^([A-Za-z0-9]+-[A-Za-z0-9]+-[A-Za-z0-9]+-[A-Za-z0-9]+-[A-Za-z0-9]+)")
+        .unwrap();
+    let revision_re = Regex::new(r"(?:\(|\[)([A-Za-z0-9]+)(?:\)|\])").unwrap();
+
+    // We collect problems as we go, then join them into one message at the end.
+    // A Vec<&str> is like a List<string> in C#.
+    let mut problems: Vec<&str> = Vec::new();
+
+    // --- Step 1: try the 5-part code -------------------------------------
+    let code = match code_re.find(filename_stem) {
+        Some(m) => Some(m.as_str().to_string()),
+        None => {
+            problems.push("missing 5-part code");
+            None
+        }
+    };
+
+    // --- Step 2: try the revision ----------------------------------------
+    let revision = match revision_re.captures(filename_stem) {
+        Some(caps) => Some(caps[1].to_string()),
+        None => {
+            problems.push("missing revision");
+            None
+        }
+    };
+
+    // --- Step 3: try the optional name -----------------------------------
+    // The name lives between the code and the first bracket. If we have no
+    // code, there's nothing reliable to anchor on, so we treat the whole
+    // string up to the first bracket as the candidate region.
+    //
+    // `code.as_deref()` turns Option<String> into Option<&str> so we can
+    // measure its length without moving it out of `code`.
+    let after_code = match code.as_deref() {
+        Some(c) => &filename_stem[c.len()..],
+        None => filename_stem,
+    };
+
+    let bracket_pos = after_code.find(|c| c == '(' || c == '[');
+    let name = if let Some(pos) = bracket_pos {
+        let raw = after_code[..pos].trim_matches(|c: char| {
+            c == ' ' || c == '-' || c == '_'
+        });
+        if raw.is_empty() { None } else { Some(raw.to_string()) }
+    } else {
+        None
+    };
+
+    // --- Build the flag reason -------------------------------------------
+    // No problems  -> None (file is clean).
+    // Some problems -> join them: "missing 5-part code; missing revision".
+    let flag_reason = if problems.is_empty() {
+        None
+    } else {
+        Some(problems.join("; "))
+    };
+
+    LenientParse { code, name, revision, flag_reason }
+}

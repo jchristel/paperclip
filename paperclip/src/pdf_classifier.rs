@@ -8,6 +8,29 @@ use std::path::PathBuf;
 // Its presence is the "is this a binder?" test.
 const BINDER_TOOL_KEY: &[u8] = b"BinderTool";
 
+// Files larger than this are skipped without being parsed.
+// Document::load reads and parses the ENTIRE file into memory, so a 1GB+
+// PDF spikes CPU and RAM until the machine becomes unresponsive. We guard
+// against that *before* loading.
+//
+// `u64` because file sizes can exceed what a 32-bit int holds.
+// 500 * 1024 * 1024 = 500 MiB. Tune this to taste — it's just a ceiling.
+// The `_` separators are like digit grouping; they're ignored by the compiler.
+const MAX_PDF_SIZE_BYTES: u64 = 500 * 1024 * 1024;
+
+/// Returns the file size in bytes, or None if it can't be read.
+///
+/// Rust separates "metadata" (size, timestamps) from opening the file's
+/// contents — like `new FileInfo(path).Length` in C# or `os.path.getsize`
+/// in Python. Reading metadata is cheap: it does NOT load the file.
+///
+/// `std::fs::metadata` returns Result<Metadata>. We use `.ok()` to turn
+/// Result<T, E> into Option<T> (discarding the error), then `.map` to pull
+/// out just the length. If anything fails we get None.
+fn file_size_bytes(path: &PathBuf) -> Option<u64> {
+    std::fs::metadata(path).ok().map(|meta| meta.len())
+}
+
 // --- Result type ---------------------------------------------------------
 
 // This enum represents the outcome of classifying a single PDF.
@@ -27,6 +50,12 @@ pub enum PdfKind {
     Unreadable {
         reason: String,
     },
+
+    /// File exceeds the size limit and was skipped without being parsed.
+    /// We carry the actual size so the log/summary can report it.
+    TooLarge {
+        size_bytes: u64,
+    },
 }
 
 // Bundles the path and its classification together.
@@ -42,6 +71,24 @@ pub struct ClassifiedPdf {
 /// Classifies a single PDF as Regular, Binder, or Unreadable.
 /// Called once per file inside the progress bar loop in binder.rs.
 pub fn classify(path: &PathBuf) -> ClassifiedPdf {
+    // --- Size guard: bail out BEFORE loading -----------------------------
+    // This must come first. Document::load below would read and parse the
+    // whole file; for a 1GB+ PDF that is what freezes the machine.
+    //
+    // `if let Some(size) = ...` is Rust's way of saying "if this Option
+    // has a value, bind it to `size` and run this block." Like a null check
+    // combined with an assignment in one step.
+    if let Some(size) = file_size_bytes(path) {
+        if size > MAX_PDF_SIZE_BYTES {
+            return ClassifiedPdf {
+                path: path.clone(),
+                kind: PdfKind::TooLarge { size_bytes: size },
+            };
+        }
+    }
+    // If we couldn't read the size at all (None), we fall through and let
+    // Document::load try — it'll surface a real error as Unreadable.
+
     // lopdf::Document::load opens and parses the PDF.
     // We use match instead of ? because we want to return Unreadable
     // rather than propagate an error — the scan should continue even

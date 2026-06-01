@@ -7,7 +7,9 @@ mod pdf_classifier;
 mod mapper;
 mod filename_parser;
 mod log;
-mod cover_page;
+mod manifest;
+mod xmp;
+mod inspect;
 mod assembler;
 
 use anyhow::{Context, Result};
@@ -29,6 +31,11 @@ enum Commands {
     },
     /// Assemble PDFs into binders
     Binder,
+    /// Read and print the embedded manifest of a binder PDF
+    Inspect {
+        /// Path to the binder PDF to inspect
+        path: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -126,6 +133,9 @@ fn main() -> Result<()> {
         },
         Commands::Binder => {
             binder::run()?;
+        }
+        Commands::Inspect { path } => {
+            inspect::run(&path)?;
         }
     }
 

@@ -4,7 +4,6 @@ use anyhow::Result;
 use indicatif::{ProgressBar, ProgressStyle};
 use std::path::{Path, PathBuf};
 use walkdir::WalkDir;
-use colored::Colorize;
 
 pub fn run() -> Result<()> {
     let current_dir = std::env::current_dir()?;
@@ -13,7 +12,7 @@ pub fn run() -> Result<()> {
     let pdfs = find_pdfs(&current_dir);
 
     if pdfs.is_empty() {
-        println!("{}", "No PDF files found. Nothing to do.".yellow());
+        println!("No PDF files found. Nothing to do.");
         return Ok(());
     }
 
@@ -37,6 +36,7 @@ pub fn run() -> Result<()> {
     let mut regular_pdfs: Vec<PathBuf> = Vec::new();
     let mut existing_binders: Vec<(PathBuf, String)> = Vec::new();  // (path, binder_name)
     let mut unreadable: Vec<(PathBuf, String)> = Vec::new();        // (path, reason)
+    let mut too_large: Vec<(PathBuf, u64)> = Vec::new();            // (path, size_bytes)
 
     for path in &pdfs {
         // Show the current filename in the progress bar (truncated to keep it tidy)
@@ -59,6 +59,9 @@ pub fn run() -> Result<()> {
             crate::pdf_classifier::PdfKind::Unreadable { reason } => {
                 unreadable.push((classified.path, reason));
             }
+            crate::pdf_classifier::PdfKind::TooLarge { size_bytes } => {
+                too_large.push((classified.path, size_bytes));
+            }
         }
 
         pb.inc(1);  // advance the bar by 1
@@ -73,6 +76,7 @@ pub fn run() -> Result<()> {
     println!("  Regular PDFs  : {}", regular_pdfs.len());
     println!("  Existing binders : {}", existing_binders.len());
     println!("  Unreadable    : {}", unreadable.len());
+    println!("  Too large     : {}", too_large.len());
 
     if !existing_binders.is_empty() {
         println!("\nExisting binders found (will be skipped):");
@@ -88,7 +92,36 @@ pub fn run() -> Result<()> {
         }
     }
 
+    if !too_large.is_empty() {
+        println!("\nFiles too large to process (will be skipped):");
+        for (path, size_bytes) in &too_large {
+            // Convert bytes -> MB for display. `{}` formats the integer.
+            println!(
+                "  {}  — {} MB",
+                path.file_name().unwrap_or_default().to_str().unwrap_or("?"),
+                size_bytes / (1024 * 1024)
+            );
+        }
+    }
+
     // Next steps: mapper check, then binding logic
+    // --- Create the run log ----------------------------------------------
+    // Created here (not inside handle_mapper) so every path can log to it,
+    // including the no-mapper path, and so we can record the oversized
+    // files we found during classification. Log goes to the current
+    // directory — where the user invoked paperclip from.
+    let current_dir = std::env::current_dir()?;
+    let mut run_log = crate::log::RunLog::new(&current_dir);
+
+    // Record oversized files now, while we still have their sizes.
+    // These were skipped before parsing, independent of any mapper.
+    for (path, size_bytes) in &too_large {
+        let filename = path.file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("unknown");
+        run_log.skip(filename, crate::log::SkipReason::TooLarge(*size_bytes));
+    }
+
     // --- Mapper check ----------------------------------------------------
     let config = crate::settings::load()?;
 
@@ -101,16 +134,21 @@ pub fn run() -> Result<()> {
             let mapper_path = std::path::Path::new(path);
             if !mapper_path.exists() {
                 // Path is configured but file is gone
-                println!("{}", "\nWarning: Mapper file configured but not found at:".yellow());
+                println!("\nWarning: Mapper file configured but not found at:");
                 println!("  {}", path);
                 println!("Run `paperclip config set --mapper-path` to update it.");
                 handle_no_mapper(&regular_pdfs)?;
             } else {
                 // Mapper exists — read and validate it
-                handle_mapper(mapper_path, &regular_pdfs)?;
+                handle_mapper(mapper_path, &regular_pdfs, &mut run_log)?;
             }
         }
     }
+
+    // --- Write log -------------------------------------------------------
+    // Single write point for the whole run. Does nothing if no entries.
+    run_log.write()?;
+
     Ok(())
 }
 
@@ -146,7 +184,11 @@ fn handle_no_mapper(regular_pdfs: &[PathBuf]) -> Result<()> {
 
 /// Called when a mapper file is present.
 /// Reads and validates the CSV.
-fn handle_mapper(mapper_path: &std::path::Path, regular_pdfs: &[PathBuf]) -> Result<()> {
+fn handle_mapper(
+    mapper_path: &std::path::Path,
+    regular_pdfs: &[PathBuf],
+    run_log: &mut crate::log::RunLog,
+) -> Result<()> {
     println!("\nMapper file found: {}", mapper_path.display());
 
     let rows = crate::mapper::load(mapper_path)?;
@@ -155,18 +197,13 @@ fn handle_mapper(mapper_path: &std::path::Path, regular_pdfs: &[PathBuf]) -> Res
     // --- Validate output folders before doing any work -------------------
     let missing_folders = crate::mapper::validate_output_folders(&rows);
     if !missing_folders.is_empty() {
-        println!("{}", "\nError: The following output folders do not exist:".red());
+        println!("\nError: The following output folders do not exist:");
         for folder in &missing_folders {
             println!("  {}", folder);
         }
         println!("Please create them or update the mapper CSV.");
         return Ok(());
     }
-
-    // --- Create the run log ----------------------------------------------
-    // Log goes to the current directory (where the user called paperclip from)
-    let current_dir = std::env::current_dir()?;
-    let mut run_log = crate::log::RunLog::new(&current_dir);
 
     // --- Match PDFs against mapper rows ----------------------------------
     let (binder_map, unmatched) = crate::mapper::match_pdfs(regular_pdfs, &rows);
@@ -179,60 +216,58 @@ fn handle_mapper(mapper_path: &std::path::Path, regular_pdfs: &[PathBuf]) -> Res
         run_log.skip(filename, crate::log::SkipReason::NoMapperMatch);
     }
 
-    // --- Parse filenames and report invalid ones -------------------------
+    // --- Parse filenames and FLAG (not skip) odd ones --------------------
+    // Files that don't match the naming style are now KEPT in the binder and
+    // merely reported. We run the lenient parser purely to detect and log
+    // problems; the file stays in `binder_map` either way.
     println!("\nValidating filenames...");
-    // Collect invalid paths into a HashSet for fast lookup during filtering
-    let mut invalid_paths: std::collections::HashSet<&PathBuf> = std::collections::HashSet::new();
+    let mut flagged_count = 0usize;
 
     for pdf in regular_pdfs {
         let stem = pdf.file_stem()
             .and_then(|s| s.to_str())
             .unwrap_or("");
 
-        match crate::filename_parser::parse(stem) {
-            Ok(_) => {}
-            Err(e) => {
-                let msg = e.to_string();
-                let filename = pdf.file_name()
-                    .and_then(|n| n.to_str())
-                    .unwrap_or("unknown");
+        // Lenient parse never errors; flag_reason is Some(..) when something
+        // didn't match the naming convention.
+        let parsed = crate::filename_parser::parse_lenient(stem);
 
-                // Pick the right skip reason based on the error message
-                let reason = if msg.contains("5-part") {
-                    crate::log::SkipReason::InvalidFilenameFormat
-                } else {
-                    crate::log::SkipReason::MissingRevision
-                };
+        if let Some(reason) = &parsed.flag_reason {
+            let filename = pdf.file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("unknown");
 
-                println!("{}", format!("  Skipping: {} — {}", stem, msg).yellow());
-                run_log.skip(filename, reason);
-                invalid_paths.insert(pdf);
-            }
+            // Record the full reason verbatim — same text the manifest stores,
+            // so the CSV and the embedded manifest agree exactly even when a
+            // file has more than one naming problem.
+            println!("  Flagging (kept): {} — {}", stem, reason);
+            run_log.skip(filename, crate::log::SkipReason::Flagged(reason.clone()));
+            flagged_count += 1;
         }
     }
 
-    if invalid_paths.is_empty() {
-        println!("{}", "  All filenames valid.".green());
+    if flagged_count == 0 {
+        println!("  All filenames valid.");
+    } else {
+        println!("  {} file(s) flagged but kept in their binders.", flagged_count);
     }
 
-    // --- Filter binder_map to remove invalid files -----------------------
-    // Retain only files that are NOT in the invalid set
+    // --- Binder plan: every matched file is kept -------------------------
+    // No filtering anymore — flagged files remain. We just rebind the name so
+    // the downstream plan/assembly code is unchanged. The inner Vec<&PathBuf>
+    // is wrapped to Vec<&&PathBuf> to match assemble_all's expected shape.
     let filtered_binder_map: std::collections::HashMap<&String, Vec<&&PathBuf>> = binder_map
         .iter()
         .map(|(binder_name, files)| {
-            let valid_files: Vec<&&PathBuf> = files
-                .iter()
-                .filter(|f| !invalid_paths.contains(*f))
-                .collect();
-            (binder_name, valid_files)
+            let kept: Vec<&&PathBuf> = files.iter().collect();
+            (binder_name, kept)
         })
-        .filter(|(_, files)| !files.is_empty())  // drop binders with no valid files left
         .collect();
 
     // --- Print binder plan -----------------------------------------------
     println!("\nBinders to assemble:");
     if filtered_binder_map.is_empty() {
-        println!("  (none — no valid PDFs matched any mapper row)");
+        println!("  (none — no PDFs matched any mapper row)");
     } else {
         let mut binder_names: Vec<&&String> = filtered_binder_map.keys().collect();
         binder_names.sort();
@@ -255,11 +290,8 @@ fn handle_mapper(mapper_path: &std::path::Path, regular_pdfs: &[PathBuf]) -> Res
 
     // --- Assemble binders ------------------------------------------------
     if !filtered_binder_map.is_empty() {
-        crate::assembler::assemble_all(&filtered_binder_map, &rows, &mut run_log)?;
+        crate::assembler::assemble_all(&filtered_binder_map, &rows, run_log)?;
     }
-
-    // --- Write log -------------------------------------------------------
-    run_log.write()?;
 
     Ok(())
 }
