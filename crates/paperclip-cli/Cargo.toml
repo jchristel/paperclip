@@ -28,10 +28,9 @@ colored = "2"
 rayon = "1.12.0"
 flate2 = "1.1.9"
 
-# The new library crate. Commented out until aconex/src/lib.rs has something
-# to export — a path dependency to an empty lib compiles fine, but there's
-# nothing to call yet, so we wire it in the session where we first use it.
-# aconex = { path = "../aconex" }
+# The new library crate. This is a path dependency, meaning it points to a local directory rather than a published crate on crates.io.
+aconex = { path = "../aconex" }
+tokio = { version = "1.52.3", features = ["full"] }
 
 [dependencies.windows]
 version = "0.58"

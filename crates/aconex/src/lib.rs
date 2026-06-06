@@ -7,9 +7,10 @@
 
 // --- Modules -------------------------------------------------------------
 // `mod` declares a module and tells the compiler to pull in the matching file
-// (auth.rs, error.rs). `pub mod` makes the module itself reachable from
-// outside the crate, so callers *could* write `aconex::auth::BasicAuth`.
+// (auth.rs, error.rs, client.rs). `pub mod` makes the module itself reachable
+// from outside the crate.
 pub mod auth;
+pub mod client;
 pub mod error;
 
 // --- Re-exports ----------------------------------------------------------
@@ -19,4 +20,5 @@ pub mod error;
 // top level. The module paths above still work too; this is just convenience
 // for the names people reach for most.
 pub use auth::{Authenticator, BasicAuth, Header, OAuth};
+pub use client::Client;
 pub use error::{AconexError, Result};

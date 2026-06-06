@@ -39,6 +39,14 @@ pub enum AconexError {
     /// change to this enum.
     #[error("invalid header {name}: {reason}")]
     InvalidHeader { name: String, reason: String },
+
+    /// A transport- or HTTP-level failure: the request couldn't be sent, timed
+    /// out, or came back with a non-success status. We store a String rather
+    /// than the underlying reqwest::Error so this enum doesn't leak reqwest
+    /// into the crate's public API — callers match on AconexError, and we stay
+    /// free to swap the HTTP library later without a breaking change.
+    #[error("http error: {0}")]
+    Http(String),
 }
 
 /// A crate-local Result alias so signatures read `Result<T>` instead of
