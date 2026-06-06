@@ -1,0 +1,8 @@
+[package]
+name = "aconex"
+version = "0.0.1"
+edition = "2024"
+
+# Empty for now. We add reqwest, serde, etc. in the next session when we
+# write the first real client code.
+[dependencies]

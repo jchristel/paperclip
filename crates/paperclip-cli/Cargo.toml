@@ -1,0 +1,41 @@
+[package]
+name = "paperclip"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+# These four now pull their version from [workspace.dependencies] at the root.
+# `workspace = true` means "use whatever the workspace declared" — like
+# referencing a centrally-managed package version instead of pinning here.
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+chrono = { workspace = true }
+uuid = { workspace = true }
+
+# These stay crate-local: only the CLI uses them, so there's no value in
+# hoisting them to the workspace.
+toml = "0.8"
+dirs = "5"
+clap = { version = "4", features = ["derive"] }
+rpassword = "7"
+lopdf = "0.40"
+indicatif = "0.17"
+csv = "1"
+regex = "1"
+walkdir = "2.5.0"
+colored = "2"
+rayon = "1.12.0"
+flate2 = "1.1.9"
+
+# The new library crate. Commented out until aconex/src/lib.rs has something
+# to export — a path dependency to an empty lib compiles fine, but there's
+# nothing to call yet, so we wire it in the session where we first use it.
+# aconex = { path = "../aconex" }
+
+[dependencies.windows]
+version = "0.58"
+features = [
+    "Win32_Security_Credentials",  # CredWriteW, CredReadW, CredFree
+    "Win32_Foundation",            # TRUE, FALSE, GetLastError
+]

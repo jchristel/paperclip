@@ -1,0 +1,26 @@
+# Workspace manifest — the ".sln" of the project.
+# It contains NO [package] section: a workspace root is not itself a crate,
+# it just groups the member crates listed below.
+[workspace]
+
+# Use Cargo's modern dependency-resolution algorithm.
+# Required for edition 2024 crates; "1" is the older default kept for
+# backwards-compatibility. Always set "2" (soon "3") for new workspaces.
+resolver = "2"
+
+# The member crates. Glob "crates/*" picks up every folder under crates/,
+# so you won't edit this list each time you add a crate.
+members = ["crates/*"]
+
+# --- Shared dependency versions -------------------------------------------
+# [workspace.dependencies] is a central version list. Member crates opt in
+# with `foo = { workspace = true }` instead of repeating "1.0.x" everywhere.
+# Think of it like <PackageVersion> in a Directory.Packages.props file in
+# .NET, or a shared constraints file in Python. Optional, but it stops the
+# CLI and the aconex crate from drifting onto different serde versions.
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+chrono = "0.4"
+uuid = { version = "1", features = ["v4"] }
