@@ -5,13 +5,18 @@
 // for a binary. Whatever is marked `pub` here is what other crates (like
 // paperclip-cli) can see, similar to `public` types in a C# class library.
 
-// A placeholder so the crate compiles with no warnings about being empty.
-// We'll replace this with real modules (client, auth, ...) next time.
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn it_builds() {
-        // Proves the crate compiles and the test harness runs.
-        assert_eq!(2 + 2, 4);
-    }
-}
+// --- Modules -------------------------------------------------------------
+// `mod` declares a module and tells the compiler to pull in the matching file
+// (auth.rs, error.rs). `pub mod` makes the module itself reachable from
+// outside the crate, so callers *could* write `aconex::auth::BasicAuth`.
+pub mod auth;
+pub mod error;
+
+// --- Re-exports ----------------------------------------------------------
+// `pub use` lifts the commonly-used types up to the crate root so callers can
+// write the shorter `aconex::BasicAuth` instead of `aconex::auth::BasicAuth`.
+// This is the Rust equivalent of curating what a C# namespace surfaces at its
+// top level. The module paths above still work too; this is just convenience
+// for the names people reach for most.
+pub use auth::{Authenticator, BasicAuth, Header, OAuth};
+pub use error::{AconexError, Result};

@@ -6,3 +6,5 @@ edition = "2024"
 # Empty for now. We add reqwest, serde, etc. in the next session when we
 # write the first real client code.
 [dependencies]
+base64 = "0.22.1"
+thiserror = "2.0.18"
