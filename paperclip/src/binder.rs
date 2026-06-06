@@ -4,6 +4,7 @@ use anyhow::Result;
 use indicatif::{ProgressBar, ProgressStyle};
 use std::path::{Path, PathBuf};
 use walkdir::WalkDir;
+use rayon::prelude::*;   // brings par_iter() into scope, like `using System.Linq;` for PLINQ
 
 pub fn run() -> Result<()> {
     let current_dir = std::env::current_dir()?;
@@ -32,39 +33,44 @@ pub fn run() -> Result<()> {
         .progress_chars("=> "),  // characters for filled / head / empty
     );
 
-    // --- Classify each PDF -----------------------------------------------
+    // --- Classify each PDF in parallel -----------------------------------
+    let classified: Vec<crate::pdf_classifier::ClassifiedPdf> = pdfs
+        .par_iter()                          // <-- the only real change: iter() -> par_iter()
+        .map(|path| {
+            let filename = path.file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("...");
+            pb.set_message(filename.to_string());
+
+            let result = crate::pdf_classifier::classify(path);
+            pb.inc(1);                       // ProgressBar is thread-safe — safe to call here
+            result
+        })
+        .collect();                          // gather all results into a Vec
+
+    pb.finish_and_clear();
+
+    // --- Bucket the results (sequential — mutates shared Vecs) -----------
     let mut regular_pdfs: Vec<PathBuf> = Vec::new();
-    let mut existing_binders: Vec<(PathBuf, String)> = Vec::new();  // (path, binder_name)
-    let mut unreadable: Vec<(PathBuf, String)> = Vec::new();        // (path, reason)
-    let mut too_large: Vec<(PathBuf, u64)> = Vec::new();            // (path, size_bytes)
+    let mut existing_binders: Vec<(PathBuf, String)> = Vec::new();
+    let mut unreadable: Vec<(PathBuf, String)> = Vec::new();
+    let mut too_large: Vec<(PathBuf, u64)> = Vec::new();
 
-    for path in &pdfs {
-        // Show the current filename in the progress bar (truncated to keep it tidy)
-        let filename = path.file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("...");
-        pb.set_message(format!("{}", filename));
-
-        let classified = crate::pdf_classifier::classify(path);
-
-        // Match on the kind and sort into the right bucket
-        // This is equivalent to a C# switch on a discriminated union
-        match classified.kind {
-            crate::pdf_classifier::PdfKind::Regular =>{
-                regular_pdfs.push(classified.path);
+    for classified_pdf in classified {
+        match classified_pdf.kind {
+            crate::pdf_classifier::PdfKind::Regular => {
+                regular_pdfs.push(classified_pdf.path);
             }
             crate::pdf_classifier::PdfKind::Binder { binder_name } => {
-                existing_binders.push((classified.path, binder_name));
+                existing_binders.push((classified_pdf.path, binder_name));
             }
             crate::pdf_classifier::PdfKind::Unreadable { reason } => {
-                unreadable.push((classified.path, reason));
+                unreadable.push((classified_pdf.path, reason));
             }
             crate::pdf_classifier::PdfKind::TooLarge { size_bytes } => {
-                too_large.push((classified.path, size_bytes));
+                too_large.push((classified_pdf.path, size_bytes));
             }
         }
-
-        pb.inc(1);  // advance the bar by 1
     }
 
     // finish_and_clear removes the bar from the terminal so our

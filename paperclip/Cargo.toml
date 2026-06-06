@@ -1,6 +1,6 @@
 [package]
 name = "paperclip"
-version = "0.1.0"
+version = "0.0.3"
 edition = "2024"
 
 [dependencies]
@@ -20,6 +20,7 @@ chrono = "0.4"
 walkdir = "2.5.0"
 colored = "2"
 flate2 = "1"        # deflate/zlib compression for the XMP metadata stream
+rayon = "1" # parallel processing for faster pdf classification
 
 [dependencies.windows]
 version = "0.58"
