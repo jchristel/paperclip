@@ -37,8 +37,21 @@ enum Commands {
         /// Path to the binder PDF to inspect
         path: String,
     },
-    /// Test Aconex API connectivity
+    /// Interact with the Aconex API
+    Aconex {
+        #[command(subcommand)]
+        action: AconexAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum AconexAction {
+    /// Test Aconex API connectivity (prints raw response)
     Ping,
+    /// List all Aconex projects visible to you
+    Projects,
+    /// Show the project currently set in config (resolves name → id)
+    Project,
 }
 
 #[derive(Subcommand)]
@@ -170,13 +183,21 @@ async fn main() -> Result<()> {
         },
         Commands::Binder => {
             binder::run()?;
-        }
+        },
         Commands::Inspect { path } => {
             inspect::run(&path)?;
-        }
-        Commands::Ping => {
-            aconex_cmd::ping().await?;
-        }
+        },
+        Commands::Aconex { action } => match action {
+            AconexAction::Ping => {
+                aconex_cmd::ping().await?;
+            }
+            AconexAction::Projects => {
+                aconex_cmd::list_projects().await?;
+            }
+            AconexAction::Project => {
+                aconex_cmd::show_current_project().await?;
+            }
+        },
     }
 
     Ok(())

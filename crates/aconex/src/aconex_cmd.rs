@@ -76,14 +76,3 @@ pub async fn show_current_project() -> Result<()> {
 
     Ok(())
 }
-
-/// Raw connectivity test — prints the first chunk of the response body as-is.
-/// Useful for debugging when typed parsing fails.
-pub async fn ping() -> Result<()> {
-    let client = build_client()?;
-    println!("Calling Aconex...");
-    let body = client.get_text("/api/projects/").await?;
-    let preview: String = body.chars().take(2000).collect();
-    println!("\n--- Response (first 2000 chars) ---\n{}", preview);
-    Ok(())
-}
