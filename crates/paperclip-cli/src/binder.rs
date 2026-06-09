@@ -34,6 +34,15 @@ pub fn run() -> Result<()> {
     );
 
     // --- Classify each PDF in parallel -----------------------------------
+    // Sort heaviest-first so expensive Document::load calls are spread across
+    // threads early, when rayon has the most room to balance and steal work.
+    // Cheap files fall to the tail, where any imbalance costs little. One
+    // metadata() syscall per file — no full parse, same cheap call the size
+    // guard uses. This is what flattens the long-straggler thread.
+    let mut pdfs = pdfs;
+    pdfs.sort_by_key(|p| std::cmp::Reverse(
+        std::fs::metadata(p).map(|m| m.len()).unwrap_or(0)
+    ));
     let classified: Vec<crate::pdf_classifier::ClassifiedPdf> = pdfs
         .par_iter()                          // <-- the only real change: iter() -> par_iter()
         .map(|path| {
@@ -72,10 +81,6 @@ pub fn run() -> Result<()> {
             }
         }
     }
-
-    // finish_and_clear removes the bar from the terminal so our
-    // summary output isn't mixed in with the progress display
-    pb.finish_and_clear();
 
     // --- Print summary ---------------------------------------------------
     println!("\nClassification complete:");
@@ -325,6 +330,8 @@ fn find_pdfs(root: &Path) -> Vec<PathBuf> {
         })
         .collect();                        // gather the matches into a Vec
 
-    results.sort();                        // keep the stable, filename-ascending order you had before
+    // Discovery order doesn't matter — classification buckets results and the
+    // assembler re-sorts each binder's files by name anyway. We deliberately
+    // skip a sort here; classification sorts by size instead (see run()).
     results
 }
