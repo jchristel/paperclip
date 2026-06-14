@@ -77,6 +77,65 @@ pub async fn show_current_project() -> Result<()> {
     Ok(())
 }
 
+/// Searches the document register and prints a summary of each match.
+/// Resolves the configured project first, then runs the (auto-paginating)
+/// search and shows a few identifying attributes per document.
+pub async fn search_documents(query: &str) -> Result<()> {
+    let config = crate::settings::load()?;
+    let name = config
+        .project_name
+        .context("No project set — run `paperclip config set --project <short name>`")?;
+
+    let client = build_client()?;
+
+    println!("Resolving project '{}'...", name);
+    let project = client
+        .get_project(&name)
+        .await?
+        .with_context(|| format!("Project '{}' not found in your visible projects", name))?;
+
+    println!("Searching for '{}'...", query);
+    let docs = client.search_documents(&project, query).await?;
+
+    if docs.is_empty() {
+        println!("No documents matched.");
+        return Ok(());
+    }
+
+    println!("\nFound {} document(s):\n", docs.len());
+    for d in &docs {
+        // We don't know the exact attribute names until the first live run,
+        // so print a few likely ones and fall back gracefully when absent.
+        // After we see the real response we'll tidy this to the true keys.
+        let docno = d
+            .get("DocumentNumber")
+            .or_else(|| d.get("docno"))
+            .unwrap_or("(no docno)");
+        let title = d
+            .get("Title")
+            .or_else(|| d.get("title"))
+            .unwrap_or("(no title)");
+        let rev = d
+            .get("Revision")
+            .or_else(|| d.get("revision"))
+            .unwrap_or("");
+
+        println!("  {} — {} {}", docno, title, rev);
+    }
+
+    // On the very first run it's invaluable to see the ACTUAL attribute keys
+    // that came back, so we can confirm the attribute-map assumption and fix
+    // the key names above if needed. Print the keys of the first document.
+    if let Some(first) = docs.first() {
+        let mut keys: Vec<&String> = first.attributes.keys().collect();
+        keys.sort();
+        println!("\n[debug] attribute keys on first document:");
+        println!("  {:?}", keys);
+    }
+
+    Ok(())
+}
+
 /// Raw connectivity test — prints the first chunk of the response body as-is.
 /// Useful for debugging when typed parsing fails.
 pub async fn ping() -> Result<()> {

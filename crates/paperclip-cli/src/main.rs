@@ -52,6 +52,11 @@ enum AconexAction {
     Projects,
     /// Show the project currently set in config (resolves name → id)
     Project,
+    /// Search the document register
+    Search {
+        /// The Aconex search query (e.g. a document number)
+        query: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -196,6 +201,9 @@ async fn main() -> Result<()> {
             }
             AconexAction::Project => {
                 aconex_cmd::show_current_project().await?;
+            }
+            AconexAction::Search { query } => {
+                aconex_cmd::search_documents(&query).await?;
             }
         },
     }

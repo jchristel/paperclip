@@ -6,20 +6,17 @@
 // paperclip-cli) can see, similar to `public` types in a C# class library.
 
 // --- Modules -------------------------------------------------------------
-// `mod` declares a module and tells the compiler to pull in the matching file.
-// `pub mod` makes the module itself reachable from outside the crate.
 pub mod auth;
 pub mod client;
 pub mod error;
 pub mod projects;
+pub mod search;
 
 // --- Re-exports ----------------------------------------------------------
 // `pub use` lifts the commonly-used types up to the crate root so callers can
 // write the shorter `aconex::BasicAuth` instead of `aconex::auth::BasicAuth`.
-// This is the Rust equivalent of curating what a C# namespace surfaces at its
-// top level. The module paths above still work too; this is just convenience
-// for the names people reach for most.
 pub use auth::{Authenticator, BasicAuth, Header, OAuth};
 pub use client::Client;
 pub use error::{AconexError, Result};
 pub use projects::{Project, ProjectResults};
+pub use search::Document;
