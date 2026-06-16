@@ -29,6 +29,11 @@ use crate::projects::Project;
 // map, we must still TELL Aconex which fields we want returned — unrequested
 // fields simply won't appear in the response. Extend this list freely; it
 // doesn't change the parsing (the map adapts to whatever attributes arrive).
+//
+// Temporarily unused: the diagnostic run omits return_fields entirely (see
+// search_documents). We keep this list so it's ready to switch back on once the
+// valid field names are confirmed against a known-good response.
+#[allow(dead_code)]
 const RETURN_FIELDS: &[&str] = &[
     "docno",
     "title",
@@ -155,13 +160,22 @@ impl Client {
         let mut page_number: u32 = 1;
         let mut total_pages: u32 = 1; // updated from the first response
 
-        // Build the return_fields value once — it's the same on every page.
-        let return_fields = RETURN_FIELDS.join(",");
+        // DIAGNOSTIC: for now we request NO return_fields, so Aconex returns its
+        // default field set. This (a) isolates whether the earlier HTTP 400 was
+        // caused by an unrecognized field name in our list, and (b) lets the
+        // first successful run reveal the real response shape. Once we confirm
+        // the shape and the valid field names, we'll pass Some(&fields) here.
+        let return_fields: Option<String> = None;
 
         loop {
             // Fetch one page.
             let page = self
-                .search_documents_page(project, query, &return_fields, page_number)
+                .search_documents_page(
+                    project,
+                    query,
+                    return_fields.as_deref(),
+                    page_number,
+                )
                 .await?;
 
             // On the first page, learn how many pages there are in total.
@@ -192,19 +206,25 @@ impl Client {
         &self,
         project: &Project,
         query: &str,
-        return_fields: &str,
+        return_fields: Option<&str>,
         page_number: u32,
     ) -> Result<RegisterSearch> {
-        // Build the query string. We URL-encode values to be safe; the Aconex
-        // query itself can contain spaces and punctuation.
-        let path = format!(
-            "/api/projects/{id}/register?search_query={q}&search_type=PAGED&page_size={size}&page_number={page}&return_fields={fields}",
+        // Build the base query string. We URL-encode values to be safe; the
+        // Aconex query itself can contain spaces and punctuation.
+        let mut path = format!(
+            "/api/projects/{id}/register?search_query={q}&search_type=PAGED&page_size={size}&page_number={page}",
             id = project.project_id,
             q = urlencode(query),
             size = PAGE_SIZE,
             page = page_number,
-            fields = urlencode(return_fields),
         );
+
+        // return_fields is OPTIONAL. Omitting it makes Aconex return its default
+        // field set — useful for isolating a 400 caused by an unrecognized field
+        // name, and for discovering the real response shape on the first run.
+        if let Some(fields) = return_fields {
+            path.push_str(&format!("&return_fields={}", urlencode(fields)));
+        }
 
         let body = self.get_text(&path).await?;
 
