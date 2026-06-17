@@ -136,6 +136,35 @@ pub async fn search_documents(query: &str) -> Result<()> {
     Ok(())
 }
 
+/// DIAGNOSTIC: runs a register search and prints the RAW XML body, unparsed.
+/// Lets us see the exact <Document> structure (attributes vs child elements)
+/// so we can model it correctly. Temporary — remove once the shape is known.
+pub async fn search_documents_raw(query: &str) -> Result<()> {
+    let config = crate::settings::load()?;
+    let name = config
+        .project_name
+        .context("No project set — run `paperclip config set --project <short name>`")?;
+
+    let client = build_client()?;
+    let project = client
+        .get_project(&name)
+        .await?
+        .with_context(|| format!("Project '{}' not found", name))?;
+
+    // Build the same minimal URL the search uses (no return_fields), but fetch
+    // the body as text and print it directly.
+    let path = format!(
+        "/api/projects/{id}/register?search_query={q}&search_type=PAGED&page_size=10&page_number=1",
+        id = project.project_id,
+        q = query, // simple query, no spaces — fine unencoded for this probe
+    );
+
+    let body = client.get_text(&path).await?;
+    println!("{}", body);
+    Ok(())
+}
+
+
 /// Raw connectivity test — prints the first chunk of the response body as-is.
 /// Useful for debugging when typed parsing fails.
 pub async fn ping() -> Result<()> {

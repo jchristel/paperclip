@@ -57,6 +57,10 @@ enum AconexAction {
         /// The Aconex search query (e.g. a document number)
         query: String,
     },
+    /// DIAGNOSTIC: print raw search XML to inspect document structure
+    SearchRaw {
+        query: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -204,6 +208,9 @@ async fn main() -> Result<()> {
             }
             AconexAction::Search { query } => {
                 aconex_cmd::search_documents(&query).await?;
+            }
+            AconexAction::SearchRaw { query } => {
+                aconex_cmd::search_documents_raw(&query).await?;
             }
         },
     }
