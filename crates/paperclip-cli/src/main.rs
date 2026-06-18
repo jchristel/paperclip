@@ -12,6 +12,7 @@ mod xmp;
 mod inspect;
 mod assembler;
 mod aconex_cmd;
+mod aconex_diag;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
@@ -46,8 +47,6 @@ enum Commands {
 
 #[derive(Subcommand)]
 enum AconexAction {
-    /// Test Aconex API connectivity (prints raw response)
-    Ping,
     /// List all Aconex projects visible to you
     Projects,
     /// Show the project currently set in config (resolves name → id)
@@ -57,7 +56,18 @@ enum AconexAction {
         /// The Aconex search query (e.g. a document number)
         query: String,
     },
-    /// DIAGNOSTIC: print raw search XML to inspect document structure
+    /// Low-level diagnostic probes for tracing API issues
+    Diag {
+        #[command(subcommand)]
+        action: DiagAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum DiagAction {
+    /// Raw connectivity test (proves auth + transport, no parsing)
+    Ping,
+    /// Raw register search — prints unparsed XML to inspect structure
     SearchRaw {
         query: String,
     },
@@ -197,9 +207,6 @@ async fn main() -> Result<()> {
             inspect::run(&path)?;
         },
         Commands::Aconex { action } => match action {
-            AconexAction::Ping => {
-                aconex_cmd::ping().await?;
-            }
             AconexAction::Projects => {
                 aconex_cmd::list_projects().await?;
             }
@@ -209,9 +216,14 @@ async fn main() -> Result<()> {
             AconexAction::Search { query } => {
                 aconex_cmd::search_documents(&query).await?;
             }
-            AconexAction::SearchRaw { query } => {
-                aconex_cmd::search_documents_raw(&query).await?;
-            }
+            AconexAction::Diag { action } => match action {
+                DiagAction::Ping => {
+                    aconex_diag::ping().await?;
+                }
+                DiagAction::SearchRaw { query } => {
+                    aconex_diag::search_raw(&query).await?;
+                }
+            },
         },
     }
 

@@ -1,12 +1,18 @@
 // src/aconex_cmd.rs
-// Bridges stored CLI credentials into the aconex library and makes API calls.
+// The "real" Aconex commands: typed operations over the aconex library.
+// Diagnostic/raw-probe commands live in aconex_diag.rs instead, so this file
+// stays focused on the clean, typed API surface.
 
 use anyhow::{Context, Result};
 
 /// Builds an authenticated client from the three stored credentials.
-/// Factored out so every command (ping, projects, ...) reuses the same setup
-/// instead of repeating the credential-gathering each time.
-fn build_client() -> Result<aconex::Client> {
+/// Factored out so every command reuses the same setup instead of repeating
+/// the credential-gathering each time.
+///
+/// `pub(crate)` = visible to other modules in THIS crate (e.g. aconex_diag),
+/// but NOT part of the binary's public surface. It's the Rust equivalent of
+/// C#'s `internal`: shared across the crate, hidden from outside.
+pub(crate) fn build_client() -> Result<aconex::Client> {
     let config = crate::settings::load()?;
 
     let username = config
@@ -24,8 +30,18 @@ fn build_client() -> Result<aconex::Client> {
     Ok(aconex::Client::new(auth))
 }
 
-/// Lists every project visible to the authenticated user, now with typed
-/// parsing — each project's id, short name, and name are pulled from the XML.
+/// Loads the configured project name from settings, or returns a helpful error.
+/// Shared by the commands that operate on "the current project".
+///
+/// Also pub(crate) so the diagnostic commands can resolve the same project.
+pub(crate) fn current_project_name() -> Result<String> {
+    let config = crate::settings::load()?;
+    config
+        .project_name
+        .context("No project set — run `paperclip config set --project <short name>`")
+}
+
+/// Lists every project visible to the authenticated user, with typed parsing.
 pub async fn list_projects() -> Result<()> {
     let client = build_client()?;
 
@@ -49,11 +65,7 @@ pub async fn list_projects() -> Result<()> {
 /// Resolves the project name stored in config to its full record + numeric id —
 /// the id every other Aconex endpoint needs.
 pub async fn show_current_project() -> Result<()> {
-    let config = crate::settings::load()?;
-    let name = config
-        .project_name
-        .context("No project set — run `paperclip config set --project <short name>`")?;
-
+    let name = current_project_name()?;
     let client = build_client()?;
 
     println!("Looking up project '{}'...", name);
@@ -70,7 +82,7 @@ pub async fn show_current_project() -> Result<()> {
                 "\nNo project with short name '{}' was found in your visible projects.",
                 name
             );
-            println!("Run `paperclip projects` to see the list of available short names.");
+            println!("Run `paperclip aconex projects` to see the available short names.");
         }
     }
 
@@ -81,11 +93,7 @@ pub async fn show_current_project() -> Result<()> {
 /// Resolves the configured project first, then runs the (auto-paginating)
 /// search and shows a few identifying attributes per document.
 pub async fn search_documents(query: &str) -> Result<()> {
-    let config = crate::settings::load()?;
-    let name = config
-        .project_name
-        .context("No project set — run `paperclip config set --project <short name>`")?;
-
+    let name = current_project_name()?;
     let client = build_client()?;
 
     println!("Resolving project '{}'...", name);
@@ -104,9 +112,9 @@ pub async fn search_documents(query: &str) -> Result<()> {
 
     println!("\nFound {} document(s):\n", docs.len());
     for d in &docs {
-        // We don't know the exact attribute names until the first live run,
-        // so print a few likely ones and fall back gracefully when absent.
-        // After we see the real response we'll tidy this to the true keys.
+        // NOTE: exact key names are still being confirmed against a real
+        // response (see the diag search-raw command). These fall back
+        // gracefully until we pin down the true child-element names.
         let docno = d
             .get("DocumentNumber")
             .or_else(|| d.get("docno"))
@@ -123,55 +131,5 @@ pub async fn search_documents(query: &str) -> Result<()> {
         println!("  {} — {} {}", docno, title, rev);
     }
 
-    // On the very first run it's invaluable to see the ACTUAL attribute keys
-    // that came back, so we can confirm the attribute-map assumption and fix
-    // the key names above if needed. Print the keys of the first document.
-    if let Some(first) = docs.first() {
-        let mut keys: Vec<&String> = first.attributes.keys().collect();
-        keys.sort();
-        println!("\n[debug] attribute keys on first document:");
-        println!("  {:?}", keys);
-    }
-
-    Ok(())
-}
-
-/// DIAGNOSTIC: runs a register search and prints the RAW XML body, unparsed.
-/// Lets us see the exact <Document> structure (attributes vs child elements)
-/// so we can model it correctly. Temporary — remove once the shape is known.
-pub async fn search_documents_raw(query: &str) -> Result<()> {
-    let config = crate::settings::load()?;
-    let name = config
-        .project_name
-        .context("No project set — run `paperclip config set --project <short name>`")?;
-
-    let client = build_client()?;
-    let project = client
-        .get_project(&name)
-        .await?
-        .with_context(|| format!("Project '{}' not found", name))?;
-
-    // Build the same minimal URL the search uses (no return_fields), but fetch
-    // the body as text and print it directly.
-    let path = format!(
-        "/api/projects/{id}/register?search_query={q}&search_type=PAGED&page_size=10&page_number=1",
-        id = project.project_id,
-        q = query, // simple query, no spaces — fine unencoded for this probe
-    );
-
-    let body = client.get_text(&path).await?;
-    println!("{}", body);
-    Ok(())
-}
-
-
-/// Raw connectivity test — prints the first chunk of the response body as-is.
-/// Useful for debugging when typed parsing fails.
-pub async fn ping() -> Result<()> {
-    let client = build_client()?;
-    println!("Calling Aconex...");
-    let body = client.get_text("/api/projects/").await?;
-    let preview: String = body.chars().take(2000).collect();
-    println!("\n--- Response (first 2000 chars) ---\n{}", preview);
     Ok(())
 }

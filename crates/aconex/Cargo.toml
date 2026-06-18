@@ -1,6 +1,6 @@
 [package]
 name = "aconex"
-version = "0.0.4"
+version = "0.0.5"
 edition = "2024"
 
 # Empty for now. We add reqwest, serde, etc. in the next session when we
