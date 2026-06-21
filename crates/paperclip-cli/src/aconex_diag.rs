@@ -32,7 +32,13 @@ pub async fn ping() -> Result<()> {
 /// Raw register search. Runs a search and prints the unparsed XML body, so the
 /// exact <Document> structure (attributes vs child elements) is visible. Use
 /// this to confirm or correct the typed search model when results look wrong.
-pub async fn search_raw(query: &str) -> Result<()> {
+///
+/// `fields` lets you control return_fields from the command line:
+///   * empty   → request nothing; Aconex returns bare DocumentId stubs (the
+///               minimal connectivity/structure probe).
+///   * provided→ request exactly those fields, so you can confirm which names
+///               are valid (a bad name returns HTTP 400 — bisect to find it).
+pub async fn search_raw(query: &str, fields: &[String]) -> Result<()> {
     let name = current_project_name()?;
     let client = build_client()?;
 
@@ -41,13 +47,23 @@ pub async fn search_raw(query: &str) -> Result<()> {
         .await?
         .with_context(|| format!("Project '{}' not found", name))?;
 
-    // Mirror the working typed search request: page_size=500 (Aconex rejects
-    // some other sizes — e.g. 10 returns HTTP 400 on this endpoint).
-    let path = format!(
+    // Base request — mirror the working typed search: page_size=500 (Aconex
+    // rejects some other sizes, e.g. 10 returns HTTP 400 on this endpoint).
+    let mut path = format!(
         "/api/projects/{id}/register?search_query={q}&search_type=PAGED&page_size=500&page_number=1",
         id = project.project_id,
         q = urlencode(query),
     );
+
+    // Append return_fields only if the caller supplied any. Joining with ',' is
+    // what Aconex expects; we encode the whole joined value.
+    if !fields.is_empty() {
+        let joined = fields.join(",");
+        path.push_str(&format!("&return_fields={}", urlencode(&joined)));
+        println!("[diag] requesting fields: {}", joined);
+    } else {
+        println!("[diag] no fields requested — expect DocumentId-only stubs");
+    }
 
     let body = client.get_text(&path).await?;
     println!("{}", body);

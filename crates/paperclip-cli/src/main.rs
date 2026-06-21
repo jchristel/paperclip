@@ -70,6 +70,8 @@ enum DiagAction {
     /// Raw register search — prints unparsed XML to inspect structure
     SearchRaw {
         query: String,
+        #[arg(trailing_var_arg = true)]
+        fields: Vec<String>,
     },
 }
 
@@ -171,7 +173,7 @@ async fn main() -> Result<()> {
                 }
 
                 // password is a bool — true means the user passed --password.
-                // rpassword::prompt_password prints the prompt but hides the keystrokes,
+                // password::prompt_password prints the prompt but hides the keystrokes,
                 // like Console.ReadLine() with ConsoleKey interception in C#
                 if password {
                     let pw = rpassword::prompt_password("Enter Aconex password: ")
@@ -220,8 +222,8 @@ async fn main() -> Result<()> {
                 DiagAction::Ping => {
                     aconex_diag::ping().await?;
                 }
-                DiagAction::SearchRaw { query } => {
-                    aconex_diag::search_raw(&query).await?;
+                DiagAction::SearchRaw { query, fields } => {
+                    aconex_diag::search_raw(&query, &fields).await?;
                 }
             },
         },
