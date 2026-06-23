@@ -73,6 +73,8 @@ enum DiagAction {
         #[arg(trailing_var_arg = true)]
         fields: Vec<String>,
     },
+    /// Print the raw register schema (discovers available + custom fields)
+    Schema,
 }
 
 #[derive(Subcommand)]
@@ -224,6 +226,9 @@ async fn main() -> Result<()> {
                 }
                 DiagAction::SearchRaw { query, fields } => {
                     aconex_diag::search_raw(&query, &fields).await?;
+                }
+                DiagAction::Schema => {
+                    aconex_diag::schema().await?;
                 }
             },
         },

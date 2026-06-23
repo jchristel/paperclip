@@ -6,12 +6,9 @@
 use anyhow::{Context, Result};
 
 /// Builds an authenticated client from the three stored credentials.
-/// Factored out so every command reuses the same setup instead of repeating
-/// the credential-gathering each time.
-///
 /// `pub(crate)` = visible to other modules in THIS crate (e.g. aconex_diag),
-/// but NOT part of the binary's public surface. It's the Rust equivalent of
-/// C#'s `internal`: shared across the crate, hidden from outside.
+/// but NOT part of the binary's public surface — Rust's equivalent of C#'s
+/// `internal`.
 pub(crate) fn build_client() -> Result<aconex::Client> {
     let config = crate::settings::load()?;
 
@@ -23,17 +20,12 @@ pub(crate) fn build_client() -> Result<aconex::Client> {
     let app_key = crate::settings::load_app_key()?
         .context("No app key stored — run `paperclip config set --app-key`")?;
 
-    // The `?` converts aconex::AconexError into anyhow::Error automatically
-    // (anyhow absorbs any std error) — the reason the CLI uses anyhow while the
-    // library uses a typed error.
     let auth = aconex::BasicAuth::new(username, password, app_key)?;
     Ok(aconex::Client::new(auth))
 }
 
 /// Loads the configured project name from settings, or returns a helpful error.
-/// Shared by the commands that operate on "the current project".
-///
-/// Also pub(crate) so the diagnostic commands can resolve the same project.
+/// pub(crate) so the diagnostic commands can resolve the same project.
 pub(crate) fn current_project_name() -> Result<String> {
     let config = crate::settings::load()?;
     config
@@ -55,15 +47,13 @@ pub async fn list_projects() -> Result<()> {
 
     println!("\nFound {} project(s):\n", projects.len());
     for p in &projects {
-        // The short name is what users put in config as `project_name`.
         println!("  {} — {} (id: {})", p.project_short_name, p.project_name, p.project_id);
     }
 
     Ok(())
 }
 
-/// Resolves the project name stored in config to its full record + numeric id —
-/// the id every other Aconex endpoint needs.
+/// Resolves the project name stored in config to its full record + numeric id.
 pub async fn show_current_project() -> Result<()> {
     let name = current_project_name()?;
     let client = build_client()?;
@@ -90,8 +80,6 @@ pub async fn show_current_project() -> Result<()> {
 }
 
 /// Searches the document register and prints a summary of each match.
-/// Resolves the configured project first, then runs the (auto-paginating)
-/// search and shows a few identifying attributes per document.
 pub async fn search_documents(query: &str) -> Result<()> {
     let name = current_project_name()?;
     let client = build_client()?;
@@ -112,23 +100,12 @@ pub async fn search_documents(query: &str) -> Result<()> {
 
     println!("\nFound {} document(s):\n", docs.len());
     for d in &docs {
-        // NOTE: exact key names are still being confirmed against a real
-        // response (see the diag search-raw command). These fall back
-        // gracefully until we pin down the true child-element names.
-        let docno = d
-            .get("DocumentNumber")
-            .or_else(|| d.get("docno"))
-            .unwrap_or("(no docno)");
-        let title = d
-            .get("Title")
-            .or_else(|| d.get("title"))
-            .unwrap_or("(no title)");
-        let rev = d
-            .get("Revision")
-            .or_else(|| d.get("revision"))
-            .unwrap_or("");
-
-        println!("  {} — {} {}", docno, title, rev);
+        // Typed fields now — each is Option since a field only appears if it
+        // was requested and present. unwrap_or gives a readable fallback.
+        let docno = d.document_number.as_deref().unwrap_or("(no docno)");
+        let title = d.title.as_deref().unwrap_or("(no title)");
+        let rev = d.revision.as_deref().unwrap_or("");
+        println!("  {} [{}] — {}", docno, rev, title);
     }
 
     Ok(())
