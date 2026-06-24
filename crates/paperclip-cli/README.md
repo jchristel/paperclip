@@ -1,8 +1,8 @@
 # paperclip (CLI)
 
 The binder command-line tool: combines multiple source PDFs into named binder
-PDFs, driven by a mapper CSV. Built in Rust, installable per-user without admin
-rights. Produces `paperclip.exe`.
+PDFs, driven by a mapper CSV. Also hosts the Aconex API commands. Built in Rust,
+installable per-user without admin rights. Produces `paperclip.exe`.
 
 This crate is the `paperclip` binary within the workspace. Build and run it from
 the workspace root with `cargo run -p paperclip -- <args>`.
@@ -11,10 +11,17 @@ the workspace root with `cargo run -p paperclip -- <args>`.
 
 ## What the tool does
 
-Discovers PDFs beneath the calling directory, classifies each one, matches them
-to binders by filename prefix using a mapper CSV, merges the matched PDFs into a
-single binder per `binder_name`, and embeds a self-describing manifest (as a
-compressed XMP metadata stream) into each binder it writes.
+Two areas of functionality:
+
+**Binder assembly.** Discovers PDFs beneath the calling directory, classifies
+each one, matches them to binders by filename prefix using a mapper CSV, merges
+the matched PDFs into a single binder per `binder_name`, and embeds a
+self-describing manifest (as a compressed XMP metadata stream) into each binder
+it writes.
+
+**Aconex client.** Authenticates against the Aconex API and provides commands to
+list/resolve projects, search the document register, and run low-level
+diagnostic probes. These are thin wrappers over the `aconex` library crate.
 
 ---
 
@@ -23,7 +30,7 @@ compressed XMP metadata stream) into each binder it writes.
 ```
 crates/paperclip-cli/
 └── src/
-    ├── main.rs            # Entry point, CLI argument parsing (clap)
+    ├── main.rs            # Entry point, CLI argument parsing (clap); async main
     ├── console.rs         # Enables ANSI colour output on Windows consoles
     ├── settings.rs        # Config file (TOML) + Windows Credential Manager
     ├── validator.rs       # Input validation (mapper path check, file creation prompt)
@@ -35,7 +42,9 @@ crates/paperclip-cli/
     ├── xmp.rs             # Wraps manifest as compressed XMP, attaches to / reads from PDF
     ├── assembler.rs       # Merges source PDFs into a binder + embeds manifest
     ├── inspect.rs         # Reads & prints a binder's manifest; rename detection
-    └── log.rs             # Writes skip/flag log CSV
+    ├── log.rs             # Writes skip/flag log CSV
+    ├── aconex_cmd.rs      # Real Aconex commands: typed project + register-search ops
+    └── aconex_diag.rs     # Low-level Aconex diagnostic probes (raw XML, schema)
 ```
 
 (`install.ps1` lives at the workspace root, not in this crate.)
@@ -50,7 +59,7 @@ crates/paperclip-cli/
 | `serde` + `toml` | Config file serialisation |
 | `dirs` | OS-standard config path (`%APPDATA%`) |
 | `windows` | Direct Win32 Credential Manager API |
-| `rpassword` | Secure password prompt (keystrokes hidden) |
+| `rpassword` | Secure password / app-key prompt (keystrokes hidden) |
 | `lopdf` | PDF reading, writing, merging |
 | `csv` | Mapper CSV and log CSV read/write |
 | `regex` | Filename pattern matching |
@@ -63,6 +72,8 @@ crates/paperclip-cli/
 | `uuid` | Binder UUID generation (`binder_id`) |
 | `flate2` | Deflate compression for the XMP manifest stream |
 | `colored` | Coloured terminal output (flags, errors) |
+| `aconex` | The workspace's Aconex client library (path dependency) |
+| `tokio` | Async runtime — `main` is async to drive Aconex calls |
 
 `serde`, `serde_json`, `anyhow`, `chrono`, and `uuid` are pulled from the
 workspace's shared dependency list; the rest are crate-local.
@@ -73,13 +84,15 @@ workspace's shared dependency list; the rest are crate-local.
 
 ### Settings
 - [x] TOML config file at `%APPDATA%\paper_clip\config.toml`
-- [x] Fields: `mapper_csv_path`, `username`, `user_id`
+- [x] Fields: `mapper_csv_path`, `username`, `user_id`, `project_name`
 - [x] Password stored in Windows Credential Manager via direct Win32 API
-- [x] `paperclip config show` — displays all settings, password masked
-- [x] `paperclip config set --username`, `--user-id`, `--mapper-path`, `--password`
+- [x] Aconex **application key** stored in Credential Manager (separate entry from the password)
+- [x] `paperclip config show` — displays all settings, secrets masked as `(stored)`
+- [x] `paperclip config set --username`, `--user-id`, `--mapper-path`, `--project`, `--password`, `--app-key`
 - [x] Mapper path validation — checks folder exists, offers to create file if missing
-- [x] Secure password prompt via `rpassword` (no plaintext in shell history)
+- [x] Secure prompts via `rpassword` for password and app key (no plaintext in shell history)
 - [x] Friendly message when no arguments supplied
+- [x] Credential Manager read/write factored into shared helpers, parameterised by target name (one copy of the unsafe Win32 code, reused for password + app key)
 
 ### Installer
 - [x] PowerShell script (`install.ps1`), no admin rights required
@@ -140,6 +153,75 @@ workspace's shared dependency list; the rest are crate-local.
 - [x] Legacy reasons `invalid_filename_format` / `missing_revision` still defined but no longer emitted (superseded by `flagged`); retained for the future per-binder pattern check
 - [x] Written to calling directory after each binder run
 
+### Aconex commands
+- [x] All Aconex operations grouped under the `aconex` subcommand
+- [x] Builds an authenticated client from stored credentials (username + password + app key)
+- [x] `aconex projects` — lists every visible project (typed)
+- [x] `aconex project` — resolves the configured project short name to its numeric id (typed)
+- [x] `aconex search "<query>"` — searches the document register, auto-paginating all pages (typed)
+- [x] Leading-wildcard queries refused client-side with a clear message (Aconex 500s on them)
+- [x] `aconex diag ping` — raw connectivity test (auth + transport, no parsing)
+- [x] `aconex diag search-raw "<query>" [fields...]` — raw search XML, optional field list for probing valid request field names
+- [x] `aconex diag schema` — raw register schema, for discovering project-specific custom fields
+- [x] Diagnostic commands reuse the same credential/project helpers via `pub(crate)` visibility
+
+---
+
+## Aconex commands
+
+All Aconex operations live under the `aconex` subcommand, the same way settings
+live under `config`. They authenticate with the stored username, password, and
+application key, and operate on the project named via `config set --project`.
+
+### Configuration
+
+```
+paperclip config set --username <value>    # your Aconex username
+paperclip config set --password            # prompted, hidden → Credential Manager
+paperclip config set --app-key             # prompted, hidden → Credential Manager
+paperclip config set --project RHH         # project short name to operate on
+paperclip config show                      # secrets shown only as "(stored)"
+```
+
+### Real commands
+
+```
+paperclip aconex projects                  # list every project visible to you
+paperclip aconex project                   # resolve the configured project name → id
+paperclip aconex search "<query>"          # search the document register (all pages)
+```
+
+`search` auto-paginates and prints a one-line summary (document number,
+revision, title) per match. The query cannot start with a wildcard (`*`/`?`) —
+Aconex rejects that with a server error, so the client refuses it up front.
+
+### Diagnostic commands
+
+The `diag` group holds low-level probes that talk to the API at the raw level:
+they print unparsed responses and bypass the typed layer, so they keep working
+(and keep showing what's on the wire) even when a typed command breaks on a
+response change. Useful for tracing issues and discovering project-specific
+fields.
+
+```
+paperclip aconex diag ping                            # raw connectivity test
+paperclip aconex diag search-raw "<query>"            # raw search XML; DocumentId-only stubs
+paperclip aconex diag search-raw "<query>" docno title revision
+                                                      # raw search requesting specific fields
+paperclip aconex diag schema                          # raw register schema (custom-field discovery)
+```
+
+Quirks learned from the live API (also documented in the `aconex` crate):
+
+- **Field request names are lowercase** (`docno`, `title`, `revisiondate`) and
+  differ from the PascalCase response element names (`DocumentNumber`, `Title`,
+  `RevisionDate`). Requesting a response-style name returns HTTP 400.
+- `search-raw` with **no fields** returns `DocumentId`-only stubs; pass field
+  names to populate the rest.
+- `page_size` is constrained — 500 is known-good, some smaller values 400.
+- `diag schema` discovers custom, project-specific fields beyond the core set
+  the typed `search` models.
+
 ---
 
 ## What is still to do
@@ -177,11 +259,11 @@ To be designed once initial binder creation is stable. The manifest's
 gives a precise map of where each document sits so specific pages can be located
 and swapped without re-scanning the whole binder.
 
-#### Aconex API integration
-Handled by the separate [`aconex`](../aconex/README.md) library crate in this
-workspace. Credentials are already stored by this CLI (username, user_id,
-password in Credential Manager) and will be injected into the client. See that
-crate's README for its own roadmap.
+#### Further Aconex endpoints
+Document download/upload and mail are not yet exposed. They will follow the same
+pattern as `search`: a typed method in the `aconex` crate, plus an `AconexAction`
+variant here. See the [`aconex` README](../aconex/README.md) for the library
+roadmap.
 
 ---
 
@@ -201,6 +283,8 @@ crate's README for its own roadmap.
   processed. The same guard should be reused on the binder-read path (a merged
   binder of a large source is itself large). A real fix would read only the
   trailer/Info dict without a full `Document::load`.
+- Aconex XML parse failures currently surface as the `Http` error variant; a
+  dedicated `Parse` variant is planned (see the `aconex` roadmap).
 
 ---
 
@@ -211,16 +295,25 @@ paperclip config show
 paperclip config set --username <value>
 paperclip config set --user-id <value>
 paperclip config set --mapper-path <path>
+paperclip config set --project <short name>
 paperclip config set --password          # prompts securely, no echo
+paperclip config set --app-key           # prompts securely, no echo
 paperclip binder                         # run from folder containing PDFs
 paperclip inspect <file.pdf>             # print a binder's manifest + rename check
+paperclip aconex projects                # list visible projects
+paperclip aconex project                 # resolve configured project → id
+paperclip aconex search "<query>"        # search the document register
+paperclip aconex diag ping               # raw connectivity test
+paperclip aconex diag search-raw "<query>" [fields...]
+paperclip aconex diag schema             # raw register schema
 paperclip --help
 paperclip config --help
-paperclip config set --help
+paperclip aconex --help
+paperclip aconex diag --help
 ```
 
 When running through Cargo from the workspace root, prefix with `cargo run -p
-paperclip --` — e.g. `cargo run -p paperclip -- inspect mybinder.pdf`.
+paperclip --` — e.g. `cargo run -p paperclip -- aconex search "RHH-..."`.
 
 ---
 
@@ -230,6 +323,7 @@ paperclip --` — e.g. `cargo run -p paperclip -- inspect mybinder.pdf`.
 |---|---|
 | Config file | `%APPDATA%\paper_clip\config.toml` |
 | Password | Windows Credential Manager as `paper_clip/aconex_password` |
+| Application key | Windows Credential Manager as `paper_clip/aconex_app_key` |
 | Install folder | `%LOCALAPPDATA%\paperclip` (default) |
 | Skip/flag log | Calling directory, timestamped |
 | Binder output | Per `output_folder` column in mapper CSV |

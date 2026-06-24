@@ -32,7 +32,10 @@ enum Commands {
         action: ConfigAction,
     },
     /// Assemble PDFs into binders
-    Binder,
+    Binder {
+        #[command(subcommand)]
+        action: BinderAction,
+    },
     /// Read and print the embedded manifest of a binder PDF
     Inspect {
         /// Path to the binder PDF to inspect
@@ -45,6 +48,55 @@ enum Commands {
     },
 }
 
+// --- Binder command tree -------------------------------------------------
+//
+// The binder command is a 2×2 matrix:
+//     action (create | update)  ×  source (folder | aconex)
+//
+// We model the ACTION as the subcommand (the verb) and the SOURCE as a
+// nested sub-subcommand under each verb. Source is a nested subcommand
+// rather than a `--source` flag because the two sources don't carry the
+// same data: `folder` has an optional path, `aconex` has none. A nested
+// subcommand lets each source hold exactly the args it needs; a single
+// `--source <enum>` flag couldn't attach a path to only one variant.
+//
+// Resulting CLI surface:
+//     paperclip binder create folder [PATH]
+//     paperclip binder create aconex
+//     paperclip binder update folder [PATH]
+//     paperclip binder update aconex
+//
+// `create` builds new binder PDFs. `update` rebuilds only where the source
+// revision differs from what's recorded in the existing binder's manifest
+// (the rev check lives in the update path, and applies to BOTH sources).
+
+#[derive(Subcommand)]
+enum BinderAction {
+    /// Create new binders from a source
+    Create {
+        #[command(subcommand)]
+        source: BinderSource,
+    },
+    /// Update existing binders where the source revision has changed
+    Update {
+        #[command(subcommand)]
+        source: BinderSource,
+    },
+}
+
+#[derive(Subcommand)]
+enum BinderSource {
+    /// Use PDFs found in a local folder, matched to binders via the mapper CSV
+    Folder {
+        /// Folder to scan for PDFs. If omitted, uses the current directory
+        /// (the folder paperclip was invoked from) — the behaviour the old
+        /// bare `paperclip binder` had.
+        path: Option<String>,
+    },
+    /// Use documents fetched from Aconex, one search per mapper row
+    Aconex,
+}
+
 #[derive(Subcommand)]
 enum AconexAction {
     /// List all Aconex projects visible to you
@@ -55,6 +107,13 @@ enum AconexAction {
     Search {
         /// The Aconex search query (e.g. a document number)
         query: String,
+    },
+    /// Download a document by its id to a local path
+    Download {
+        /// The Aconex document id (the DocumentId from a search result)
+        document_id: String,
+        /// Where to write the file
+        dest: String,
     },
     /// Low-level diagnostic probes for tracing API issues
     Diag {
@@ -204,8 +263,23 @@ async fn main() -> Result<()> {
                 }
             }
         },
-        Commands::Binder => {
-            binder::run()?;
+        Commands::Binder { action } => match action {
+            BinderAction::Create { source } => match source {
+                BinderSource::Folder { path } => {
+                    binder::create_from_folder(path.as_deref())?;
+                }
+                BinderSource::Aconex => {
+                    binder::create_from_aconex()?;
+                }
+            },
+            BinderAction::Update { source } => match source {
+                BinderSource::Folder { path } => {
+                    binder::update_from_folder(path.as_deref())?;
+                }
+                BinderSource::Aconex => {
+                    binder::update_from_aconex()?;
+                }
+            },
         },
         Commands::Inspect { path } => {
             inspect::run(&path)?;
@@ -219,6 +293,9 @@ async fn main() -> Result<()> {
             }
             AconexAction::Search { query } => {
                 aconex_cmd::search_documents(&query).await?;
+            }
+            AconexAction::Download { document_id, dest } => {
+                aconex_cmd::download_document(&document_id, &dest).await?;
             }
             AconexAction::Diag { action } => match action {
                 DiagAction::Ping => {

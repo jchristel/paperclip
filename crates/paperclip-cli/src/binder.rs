@@ -6,11 +6,26 @@ use std::path::{Path, PathBuf};
 use walkdir::WalkDir;
 use rayon::prelude::*;   // brings par_iter() into scope, like `using System.Linq;` for PLINQ
 
-pub fn run() -> Result<()> {
-    let current_dir = std::env::current_dir()?;
-    println!("Scanning for PDFs in: {}", current_dir.display());
+/// `binder create folder [PATH]` — scan a folder for PDFs and assemble binders
+/// via the mapper CSV. This is the old `run()` body, now parameterised by the
+/// folder to scan.
+///
+/// `folder` is the optional PATH from the CLI. `None` means "use the current
+/// directory" — the behaviour bare `paperclip binder` had. We resolve it once
+/// here into `scan_dir` and use that for both the PDF scan AND the log
+/// location, so a custom folder keeps its log alongside its files.
+pub fn create_from_folder(folder: Option<&str>) -> Result<()> {
+    // Resolve the scan directory: the supplied path, or the current dir.
+    // `map(PathBuf::from)` turns Option<&str> into Option<PathBuf>; if it's
+    // None we fall back to current_dir(). The `?` handles the (rare) case
+    // where the current dir can't be read.
+    let scan_dir = match folder {
+        Some(p) => PathBuf::from(p),
+        None => std::env::current_dir()?,
+    };
+    println!("Scanning for PDFs in: {}", scan_dir.display());
 
-    let pdfs = find_pdfs(&current_dir);
+    let pdfs = find_pdfs(&scan_dir);
 
     if pdfs.is_empty() {
         println!("No PDF files found. Nothing to do.");
@@ -121,8 +136,9 @@ pub fn run() -> Result<()> {
     // including the no-mapper path, and so we can record the oversized
     // files we found during classification. Log goes to the current
     // directory — where the user invoked paperclip from.
-    let current_dir = std::env::current_dir()?;
-    let mut run_log = crate::log::RunLog::new(&current_dir);
+    // Log goes to the same folder we scanned (for a custom PATH, that's where
+    // the user pointed us; for the default, it's the current dir as before).
+    let mut run_log = crate::log::RunLog::new(&scan_dir);
 
     // Record oversized files now, while we still have their sizes.
     // These were skipped before parsing, independent of any mapper.
@@ -163,6 +179,47 @@ pub fn run() -> Result<()> {
     Ok(())
 }
 
+
+/// `binder create aconex` — build binders from Aconex search results.
+///
+/// Flow (will be async once wired to the client):
+///   - load mapper rows
+///   - for each row: run its search (row.prefix → search query) via the
+///     aconex client, download each matched document to a temp/working area
+///   - match downloaded files to the binder, assemble (fresh)
+/// TODO: needs build_client()/project resolution like aconex_cmd; make async.
+pub fn create_from_aconex() -> Result<()> {
+    println!("[stub] binder create aconex — not yet implemented");
+    Ok(())
+}
+
+/// `binder update folder [PATH]` — rebuild only where the revision changed.
+///
+/// Same as create_from_folder, but before assembling a binder:
+///   - read the existing binder PDF's manifest (xmp::read_manifest_json)
+///   - compare each source file's revision (filename_parser) against the
+///     revision recorded for that file in the manifest
+///   - rebuild only if any differ (or a file is new/removed); otherwise skip
+/// TODO: define the exact "changed" rule (any file differs → rebuild whole
+///       binder? per-file replace?). Start with whole-binder rebuild.
+pub fn update_from_folder(_folder: Option<&str>) -> Result<()> {
+    println!("[stub] binder update folder — not yet implemented");
+    Ok(())
+}
+
+/// `binder update aconex` — rev-checked rebuild from Aconex.
+///
+/// Combines create_from_aconex's fetch with update_from_folder's rev check:
+///   - for each mapper row, search Aconex; the search result carries the
+///     document Revision directly (no filename parse needed — search.rs's
+///     Document has `revision`)
+///   - compare against the existing binder manifest's recorded revisions
+///   - download + rebuild only where they differ
+/// TODO: async; reuse the rev-comparison helper from update_from_folder.
+pub fn update_from_aconex() -> Result<()> {
+    println!("[stub] binder update aconex — not yet implemented");
+    Ok(())
+}
 
 /// Called when no mapper file is available.
 /// Offers the user folder-based binding instead.
@@ -308,7 +365,7 @@ fn handle_mapper(
 }
 
 /// Recursively finds all PDF files under the given folder.
-/// Returns a sorted list of absolute paths.
+/// Returns a list of absolute paths.
 ///
 /// Uses the `walkdir` crate instead of a hand-rolled recursion. WalkDir flattens
 /// the whole tree into one iterator — the clean version of the "get the tree, then

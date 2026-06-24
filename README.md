@@ -1,8 +1,7 @@
 # Paperclip
 
 A Rust workspace containing a Windows CLI tool for assembling PDFs into named
-binders, plus a (work-in-progress) client library for the Aconex cloud document
-platform.
+binders, plus a client library for the Aconex cloud document platform.
 
 ## Workspace layout
 
@@ -11,10 +10,10 @@ paperclip/                      workspace root (this file)
 ├── Cargo.toml                  workspace manifest — groups the member crates
 ├── install.ps1                 per-user installer for the CLI (no admin needed)
 └── crates/
-    ├── paperclip-cli/          the binder CLI  →  produces paperclip.exe
+    ├── paperclip-cli/          the binder CLI + Aconex commands → paperclip.exe
     │   └── README.md           full feature list, CLI reference, file locations
-    └── aconex/                 Aconex API client library (early stub)
-        └── README.md           current state + planned surface
+    └── aconex/                 Aconex API client library
+        └── README.md           library API, design, endpoint coverage
 ```
 
 A *workspace* is Cargo's equivalent of a .NET solution (`.sln`): it groups
@@ -26,12 +25,12 @@ case of `aconex`, independently publishable later.
 
 | Crate | Kind | What it is |
 |---|---|---|
-| [`paperclip`](crates/paperclip-cli/README.md) | binary | The CLI that discovers PDFs, matches them to binders via a mapper CSV, merges them, and embeds a self-describing manifest. This is the mature part of the project. |
-| [`aconex`](crates/aconex/README.md) | library | A from-scratch Rust client for the Aconex API. Currently a stub; will grow to cover authentication, document search, upload, and mail. |
+| [`paperclip`](crates/paperclip-cli/README.md) | binary | The CLI. Discovers PDFs, matches them to binders via a mapper CSV, merges them, and embeds a self-describing manifest. Also hosts the `aconex` subcommands that drive the library. |
+| [`aconex`](crates/aconex/README.md) | library | A from-scratch async Rust client for the Aconex API. Currently covers authentication, project lookup, and document register search; more endpoints planned. |
 
-The CLI does not yet depend on the library — the dependency is wired but
-commented out until `aconex` has something to call. They are developed together
-in this workspace; the library can be split into its own published crate later
+The CLI depends on the library via a path dependency (`aconex = { path =
+"../aconex" }`). They are developed together in this workspace; the library has
+no CLI-specific dependencies and can be split into its own published crate later
 without disruption.
 
 ## Building
@@ -64,8 +63,19 @@ Copies `paperclip.exe` to a per-user location and adds it to the user `PATH`
 ## Status at a glance
 
 - **`paperclip` CLI** — functional: binder assembly, classification, embedded
-  XMP manifest, inspect/rename detection, skip-and-flag logging.
-- **`aconex` library** — scaffolding only. Authentication (username/password
-  first, OAuth stubbed for later) is the next slice of work.
+  XMP manifest, inspect/rename detection, skip-and-flag logging. Plus Aconex
+  commands: list projects, resolve the configured project, search the register,
+  and a `diag` group of low-level API probes.
+- **`aconex` library** — async client working end to end: Basic auth (OAuth
+  stubbed behind the same trait), typed project lookup, and typed, paginated
+  document search. Built on `reqwest` + `tokio` + `quick-xml`.
 
 See each crate's README for the detailed progress tracker.
+
+## A note on the relationship to the original Python
+
+The `aconex` crate is a clean-room reimplementation of an existing Python
+library, deliberately restructured (split modules, typed structs, an error
+enum, the builder/trait patterns) rather than transliterated. Endpoint URLs,
+rate limits, and similar facts about the Aconex API are reproduced because they
+are facts about the service, not creative expression.

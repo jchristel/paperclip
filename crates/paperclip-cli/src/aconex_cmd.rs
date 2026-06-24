@@ -110,3 +110,21 @@ pub async fn search_documents(query: &str) -> Result<()> {
 
     Ok(())
 }
+
+/// Downloads a document by id to a local path.
+pub async fn download_document(document_id: &str, dest: &str) -> Result<()> {
+    let name = current_project_name()?;
+    let client = build_client()?;
+
+    println!("Resolving project '{}'...", name);
+    let project = client
+        .get_project(&name)
+        .await?
+        .with_context(|| format!("Project '{}' not found in your visible projects", name))?;
+
+    println!("Downloading document {} ...", document_id);
+    let written = client.download_document(&project, document_id, dest).await?;
+
+    println!("Saved to: {}", written.display());
+    Ok(())
+}
