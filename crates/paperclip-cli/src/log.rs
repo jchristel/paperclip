@@ -13,12 +13,15 @@ use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
 
 // --- Reason enum ---------------------------------------------------------
-
+#[derive(Debug)]
 /// All possible reasons a file can be skipped.
 /// Adding a new skip reason means adding a variant here — the compiler
 /// will then flag any match that doesn't handle it.
 /// This is safer than passing raw strings around.
-#[derive(Debug)]
+// Two variants (InvalidFilenameFormat, MissingRevision) are valid log vocabulary
+// but not currently constructed — the flow moved to keep-and-Flagged rather than
+// skip. Kept as the complete reason set; as_str() already handles them.
+#[allow(dead_code)]
 pub enum SkipReason {
     /// Filename does not start with a 5-part code block
     InvalidFilenameFormat,
@@ -89,11 +92,6 @@ impl RunLog {
             filename: filename.to_string(),
             reason,
         });
-    }
-
-    /// Returns true if any entries were recorded.
-    pub fn has_entries(&self) -> bool {
-        !self.entries.is_empty()
     }
 
     /// Writes all recorded entries to a timestamped CSV file.

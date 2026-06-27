@@ -76,10 +76,7 @@ pub struct ResolvedConfig {
 
     /// Aconex username — global only (credentials never go in the project
     /// file). Carried here so callers have one config object to read.
-    pub username: Option<String>,
-
-    /// Aconex user id — global only, same rationale as username.
-    pub user_id: Option<String>,
+    pub username: Option<String>
 }
 
 // --- Loading -------------------------------------------------------------
@@ -151,6 +148,5 @@ pub fn resolve_config(dir: &Path) -> Result<ResolvedConfig> {
         doc_number_pattern,
         project_name,
         username: global.username.clone(),
-        user_id: global.user_id.clone(),
     })
 }

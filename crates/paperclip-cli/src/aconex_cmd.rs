@@ -5,16 +5,29 @@
 
 use anyhow::{Context, Result};
 
-/// Builds an authenticated client from the three stored credentials.
+/// Builds an authenticated client from the stored credentials.
+///
+/// Username comes from the resolved config (global, layered under any
+/// paperclip.toml in the working folder — though username is global-only today,
+/// so in practice it's the global value). Password and app key are ALWAYS read
+/// straight from Credential Manager: secrets never live in a project file.
+///
 /// `pub(crate)` = visible to other modules in THIS crate (e.g. aconex_diag),
 /// but NOT part of the binary's public surface — Rust's equivalent of C#'s
 /// `internal`.
 pub(crate) fn build_client() -> Result<aconex::Client> {
-    let config = crate::settings::load()?;
+    // Resolve config from the working folder, so a paperclip.toml there is
+    // honoured — the same "working folder" rule the binder folder modes use
+    // (they pass current_dir() too). `?` propagates an unreadable-cwd error.
+    let dir = std::env::current_dir()?;
+    let config = crate::project_config::resolve_config(&dir)?;
 
     let username = config
         .username
         .context("No username set — run `paperclip config set --username`")?;
+
+    // Secrets bypass resolve_config entirely — they're only in Credential
+    // Manager, never in any TOML.
     let password = crate::settings::load_password()?
         .context("No password stored — run `paperclip config set --password`")?;
     let app_key = crate::settings::load_app_key()?
@@ -24,13 +37,20 @@ pub(crate) fn build_client() -> Result<aconex::Client> {
     Ok(aconex::Client::new(auth))
 }
 
-/// Loads the configured project name from settings, or returns a helpful error.
-/// pub(crate) so the diagnostic commands can resolve the same project.
+/// Resolves the project short name to operate on.
+///
+/// Now goes through `resolve_config`, so a `project_name` in a working-folder
+/// paperclip.toml overrides the global setting — letting you switch projects by
+/// `cd`-ing between folders, exactly as the binder modes already do. Falls back
+/// to the global value when no project file sets it.
+///
+/// pub(crate) so the diagnostic commands resolve the same project.
 pub(crate) fn current_project_name() -> Result<String> {
-    let config = crate::settings::load()?;
+    let dir = std::env::current_dir()?;
+    let config = crate::project_config::resolve_config(&dir)?;
     config
         .project_name
-        .context("No project set — run `paperclip config set --project <short name>`")
+        .context("No project set — run `paperclip config set --project <short name>`, or set project_name in paperclip.toml")
 }
 
 /// Lists every project visible to the authenticated user, with typed parsing.

@@ -110,8 +110,14 @@ enum UpdateSource {
         /// assumed to be in the current working folder alongside the sources.
         path: Option<String>,
     },
-    /// Refresh existing binders against current Aconex revisions
-    Aconex,
+    /// Refresh existing binders against current Aconex revisions. PATH
+    /// optionally says where the binders to refresh live (defaults to the
+    /// working folder).
+    Aconex {
+        /// Folder containing the binders to update. If omitted, the binders are
+        /// assumed to be in the current working folder.
+        path: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -286,15 +292,15 @@ async fn main() -> Result<()> {
                     binder::create_from_folder()?;
                 }
                 CreateSource::Aconex => {
-                    binder::create_from_aconex()?;
+                    binder::create_from_aconex().await?;   // add .await
                 }
             },
             BinderAction::Update { source } => match source {
                 UpdateSource::Folder { path } => {
                     binder::update_from_folder(path.as_deref())?;
                 }
-                UpdateSource::Aconex => {
-                    binder::update_from_aconex()?;
+                UpdateSource::Aconex { path } => {
+                    binder::update_from_aconex(path.as_deref()).await?;
                 }
             },
         },

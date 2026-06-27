@@ -156,17 +156,3 @@ fn get_field(
 
     Ok(value.trim().to_string())
 }
-
-/// Validates a PDF filename against a project-specific pattern.
-///
-/// TODO: Filename validation is not yet implemented.
-/// When implemented, this should support:
-///   - Multiple configurable patterns (e.g. 5-part code, free-form, none)
-///   - Pattern defined per binder, not per row
-///   - Skipping validation entirely when no pattern is specified
-///   - Logging skipped files to the CSV log with reason "invalid_filename_format"
-///
-/// For now all filenames are considered valid.
-pub fn validate_filename(_filename: &str, _pattern: Option<&str>) -> bool {
-    true
-}

@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 use walkdir::WalkDir;
 use rayon::prelude::*;   // brings par_iter() into scope, like `using System.Linq;` for PLINQ
 use regex::Regex;
+use std::collections::{HashMap, HashSet};
 
 /// `binder create folder [PATH]` — scan a folder for PDFs and assemble binders
 /// via the mapper CSV. 
@@ -190,16 +191,236 @@ pub fn create_from_folder() -> Result<()> {
 }
 
 
+// ── module level (outside the fn) ──
+struct DownloadJob {
+    document_id: String,
+    filename: String,
+    dest: PathBuf,
+}
+
 /// `binder create aconex` — build binders from Aconex search results.
 ///
-/// Flow (will be async once wired to the client):
-///   - load mapper rows
-///   - for each row: run its search (row.prefix → search query) via the
-///     aconex client, download each matched document to a temp/working area
-///   - match downloaded files to the binder, assemble (fresh)
-/// TODO: needs build_client()/project resolution like aconex_cmd; make async.
-pub fn create_from_aconex() -> Result<()> {
-    println!("[stub] binder create aconex — not yet implemented");
+/// Flow:
+///   1. Resolve auth + project (reuses aconex_cmd's helpers).
+///   2. Load the mapper rows (same CSV as the folder path).
+///   3. For each row: search Aconex with row.prefix, keep only PDF results,
+///      download each into a temp working dir.
+///   4. Feed the downloaded paths through the SAME match_pdfs + assemble_all
+///      pipeline the folder path uses — no new assembly logic.
+///
+/// `async` because the aconex client is async (main is already #[tokio::main]).
+/// The temp dir is auto-cleaned: when `_temp` drops at end of scope, its folder
+/// and everything in it is deleted — like a C# `using` or Python's
+/// `TemporaryDirectory()` context manager.
+pub async fn create_from_aconex() -> Result<()> {
+    // --- 1. Auth + project ------------------------------------------------
+    // build_client() and current_project_name() are pub(crate) in aconex_cmd,
+    // so we can call them here. The `?` propagates any "no credentials" /
+    // "no project set" error straight out with its helpful message.
+    let client = crate::aconex_cmd::build_client()?;
+    let project_name = crate::aconex_cmd::current_project_name()?;
+
+    println!("Resolving project '{}'...", project_name);
+    let project = client
+        .get_project(&project_name)
+        .await?
+        .with_context(|| format!("Project '{}' not found in your visible projects", project_name))?;
+
+    // --- 2. Locate + load the mapper -------------------------------------
+    // Aconex create still needs the mapper: it maps each search prefix to a
+    // binder name + output folder. We resolve config from the working dir,
+    // exactly like the folder path does.
+    let work_dir = std::env::current_dir()?;
+    let config = crate::project_config::resolve_config(&work_dir)?;
+
+    // Compile the doc-number pattern up front (same early-fail behaviour as
+    // create_from_folder) so a bad mask stops the run before any network calls.
+    let code_pattern = match config.doc_number_pattern.as_deref() {
+        Some(mask) => Some(
+            crate::filename_parser::compile_doc_number_mask(mask)
+                .map_err(|e| anyhow::anyhow!("invalid document-number pattern: {e}"))?,
+        ),
+        None => None,
+    };
+
+    // The aconex path REQUIRES a mapper (unlike folder, which can fall back to
+    // folder-based binding). Without one there are no search prefixes to run.
+    let mapper_path = config.mapper_csv_path.as_ref().context(
+        "binder create aconex needs a mapper CSV (it drives the per-row searches).\n\
+         Set `mapper` in paperclip.toml or run `paperclip config set --mapper-path`.",
+    )?;
+    if !mapper_path.exists() {
+        anyhow::bail!("Mapper file configured but not found at: {}", mapper_path.display());
+    }
+
+    let rows = crate::mapper::load(mapper_path)?;
+    println!("Loaded {} mapper row(s).", rows.len());
+
+    // Validate output folders before any downloads — fail early, same as folder.
+    let missing = crate::mapper::validate_output_folders(&rows);
+    if !missing.is_empty() {
+        println!("\nError: the following output folders do not exist:");
+        for f in &missing {
+            println!("  {}", f);
+        }
+        return Ok(());
+    }
+
+    // --- 3. Temp working dir for downloads -------------------------------
+    // tempfile::tempdir() makes a uniquely-named folder under the OS temp dir.
+    // We bind it to `_temp` (leading underscore = "intentionally unused name",
+    // silences the unused-variable warning) and keep it alive for the whole
+    // function: dropping it deletes the folder. We download into temp_path.
+    let _temp = tempfile::tempdir().context("creating temp download folder")?;
+    let temp_path = _temp.path();
+    println!("Downloading into temp folder: {}", temp_path.display());
+
+    // ===================================================================
+    // PHASE 1 — search every row, dedup, resolve collision-safe dest paths
+    // ===================================================================
+    // We collect jobs here. No downloads happen in this phase — it's pure
+    // planning, so all dedup/collision decisions are made before we spend a
+    // single network round-trip on a file.
+    let mut jobs: Vec<DownloadJob> = Vec::new();
+
+    // Dedup key #1: document_id we've already planned to download. The SAME
+    // document caught by two prefixes appears twice across rows — we want it
+    // on disk once. (One temp file can still feed multiple binders, because
+    // match_pdfs re-matches by filename against every row later.)
+    let mut seen_ids: HashSet<String> = HashSet::new();
+
+    // Collision key #2: filename -> the document_id that first claimed it.
+    // Two DIFFERENT documents sharing a filename would map to the same
+    // temp_path.join(filename) and overwrite each other. We detect that here
+    // and namespace the loser's path instead of silently clobbering.
+    let mut claimed_filenames: HashMap<String, String> = HashMap::new();
+
+    // A spinner for phase 1 — we don't know the total yet (each row's count is
+    // only known after its search returns), so a spinner is the honest display
+    // for this phase. The real percentage bar comes in phase 2.
+    let search_pb = ProgressBar::new_spinner();
+    search_pb.set_style(ProgressStyle::with_template("{spinner} {msg}").unwrap());
+    search_pb.enable_steady_tick(std::time::Duration::from_millis(100));
+
+    for row in &rows {
+        search_pb.set_message(format!("searching '{}'...", row.prefix));
+        let docs = client.search_documents(&project, &row.prefix).await?;
+
+        for doc in &docs {
+            // PDF-only filter — unchanged. Non-PDFs never become jobs.
+            let filename = doc.filename.as_deref().unwrap_or("");
+            if !filename.to_ascii_lowercase().ends_with(".pdf") {
+                continue;
+            }
+
+            // --- Dedup #1: same document via two prefixes ----------------
+            // insert() returns false if the id was already present. If so,
+            // we've already planned this exact document — skip the duplicate.
+            if !seen_ids.insert(doc.document_id.clone()) {
+                continue;
+            }
+
+            // --- Collision #2: two documents, same filename --------------
+            // Default dest is temp_dir / filename. If another document already
+            // claimed this filename, that path is taken — namespace this one
+            // by prefixing its document_id so both survive on disk.
+            let dest = match claimed_filenames.get(filename) {
+                None => {
+                    // First claim on this filename — record it and use as-is.
+                    claimed_filenames.insert(filename.to_string(), doc.document_id.clone());
+                    temp_path.join(filename)
+                }
+                Some(other_id) => {
+                    // Genuine collision: different documents, same filename.
+                    // Warn (so it's visible, not silent) and disambiguate the
+                    // path with this doc's id so it can't overwrite the first.
+                    println!(
+                        "  Note: filename '{}' is shared by documents {} and {} — \
+                         keeping both by namespacing the second.",
+                        filename, other_id, doc.document_id
+                    );
+                    temp_path.join(format!("{}__{}", doc.document_id, filename))
+                }
+            };
+
+            jobs.push(DownloadJob {
+                document_id: doc.document_id.clone(),
+                filename: filename.to_string(),
+                dest,
+            });
+        }
+    }
+
+    search_pb.finish_and_clear();
+
+    if jobs.is_empty() {
+        println!("\nNo PDF documents to download. Nothing to assemble.");
+        return Ok(()); // _temp drops here, cleaning up
+    }
+
+    // ===================================================================
+    // PHASE 2 — download the planned jobs with a real percentage bar
+    // ===================================================================
+    // Now we KNOW the count, so ProgressBar::new(total) gives a true bar,
+    // same style family as the classification bar.
+    println!("\nDownloading {} PDF(s)...", jobs.len());
+    let dl_pb = ProgressBar::new(jobs.len() as u64);
+    dl_pb.set_style(
+        ProgressStyle::with_template("[{bar:40}] {pos}/{len} {msg}")
+            .unwrap()
+            .progress_chars("=> "),
+    );
+
+    let mut downloaded: Vec<PathBuf> = Vec::new();
+
+    for job in &jobs {
+        dl_pb.set_message(job.filename.clone());
+
+        client
+            .download_document(&project, &job.document_id, &job.dest)
+            .await
+            .with_context(|| format!("downloading {}", job.filename))?;
+
+        downloaded.push(job.dest.clone());
+        dl_pb.inc(1); // advance the bar one notch per completed download
+    }
+
+    dl_pb.finish_and_clear();
+
+    println!("\nDownloaded {} PDF(s). Assembling binders...", downloaded.len());
+
+    // --- 5. Reuse the existing match + assemble pipeline -----------------
+    // match_pdfs groups the downloaded files by binder_name using the same
+    // prefix matching the folder path uses. This is why we didn't need any new
+    // assembly code: the inputs are just PathBufs either way.
+    let (binder_map, unmatched) = crate::mapper::match_pdfs(&downloaded, &rows);
+
+    if !unmatched.is_empty() {
+        println!("\nDownloaded files that matched no mapper row:");
+        for f in &unmatched {
+            println!("  {}", f.file_name().unwrap_or_default().to_str().unwrap_or("?"));
+        }
+    }
+
+    // assemble_all wants Vec<&&PathBuf>, so we wrap each &PathBuf once more —
+    // exactly the same reshaping handle_mapper does before calling it.
+    let reshaped: HashMap<&String, Vec<&&PathBuf>> = binder_map
+        .iter()
+        .map(|(name, files)| (name, files.iter().collect()))
+        .collect();
+
+    // A run log, same as the folder path. Logs land in the working dir.
+    let mut run_log = crate::log::RunLog::new(&work_dir);
+
+    if reshaped.is_empty() {
+        println!("\nNo downloaded files matched any mapper row — nothing to assemble.");
+    } else {
+        crate::assembler::assemble_all(&reshaped, &rows, &mut run_log, code_pattern.as_ref())?;
+    }
+
+    run_log.write()?;
+
+    // _temp drops here → temp folder and all downloads are deleted.
     Ok(())
 }
 
@@ -376,17 +597,246 @@ pub fn update_from_folder(binder_path: Option<&str>) -> Result<()> {
     Ok(())
 }
 
+
+
 /// `binder update aconex` — rev-checked rebuild from Aconex.
 ///
-/// Combines create_from_aconex's fetch with update_from_folder's rev check:
-///   - for each mapper row, search Aconex; the search result carries the
-///     document Revision directly (no filename parse needed — search.rs's
-///     Document has `revision`)
-///   - compare against the existing binder manifest's recorded revisions
-///   - download + rebuild only where they differ
-/// TODO: async; reuse the rev-comparison helper from update_from_folder.
-pub fn update_from_aconex() -> Result<()> {
-    println!("[stub] binder update aconex — not yet implemented");
+/// Like update_from_folder, but the "current revision" comes from an Aconex
+/// search result (Document.revision) instead of a local filename. The win: we
+/// search to learn revisions, decide what changed, and only THEN download — so
+/// unchanged documents are never fetched.
+///
+/// `binder_path` says where the binders to refresh live; `None` = working dir.
+/// `async` because the aconex client is async.
+pub async fn update_from_aconex(binder_path: Option<&str>) -> Result<()> {
+    use std::collections::HashMap;
+
+    // --- Auth + project (same as create_from_aconex) ---------------------
+    let client = crate::aconex_cmd::build_client()?;
+    let project_name = crate::aconex_cmd::current_project_name()?;
+
+    println!("Resolving project '{}'...", project_name);
+    let project = client
+        .get_project(&project_name)
+        .await?
+        .with_context(|| format!("Project '{}' not found in your visible projects", project_name))?;
+
+    // --- Resolve dirs + config -------------------------------------------
+    // work_dir holds paperclip.toml (mapper/pattern). binder_dir is where the
+    // binders to update live — defaults to work_dir, matching the folder path.
+    let work_dir = std::env::current_dir()?;
+    let binder_dir = match binder_path {
+        Some(p) => PathBuf::from(p),
+        None => work_dir.clone(),
+    };
+    println!("Binders in: {}", binder_dir.display());
+
+    let config = crate::project_config::resolve_config(&work_dir)?;
+
+    // code_pattern isn't used to derive codes here (we take document_number
+    // directly), but rebuild_in_place still needs it downstream — so compile it
+    // up front and fail early on a bad mask, same as the other paths.
+    let code_pattern = match config.doc_number_pattern.as_deref() {
+        Some(mask) => Some(
+            crate::filename_parser::compile_doc_number_mask(mask)
+                .map_err(|e| anyhow::anyhow!("invalid document-number pattern: {e}"))?,
+        ),
+        None => None,
+    };
+
+    // The aconex path REQUIRES a mapper — it drives the per-row searches.
+    let mapper_path = config.mapper_csv_path.as_ref().context(
+        "binder update aconex needs a mapper CSV (it drives the per-row searches).\n\
+         Set `mapper` in paperclip.toml or run `paperclip config set --mapper-path`.",
+    )?;
+    if !mapper_path.exists() {
+        anyhow::bail!("Mapper file configured but not found at: {}", mapper_path.display());
+    }
+    let rows = crate::mapper::load(mapper_path)?;
+    println!("Loaded {} mapper row(s).", rows.len());
+
+    // --- Phase 1: search all rows → global code map ----------------------
+    // Keyed by document_number, which IS the manifest's `code` (the manifest
+    // recorded document numbers at create time). We store only what we need to
+    // (a) compare revisions and (b) download the file later if it changed.
+    //   - revision:    authoritative current rev from Aconex (Document.revision)
+    //   - document_id: the download key (download is by document, not filename)
+    // The filename is used ONLY for the .pdf extension test — never as a code,
+    // name, or download target, because uploads can be named anything.
+    struct SourceInfo {
+        revision: Option<String>,
+        document_id: String,
+    }
+    let mut by_code: HashMap<String, SourceInfo> = HashMap::new();
+
+    // Spinner: phase 1's total isn't known until every search returns, so a
+    // spinner is the honest display. (The download phase, where we know the
+    // count, could use a real bar — but per-binder downloads are tiny, so a
+    // plain println per file is enough there.)
+    let search_pb = ProgressBar::new_spinner();
+    search_pb.set_style(ProgressStyle::with_template("{spinner} {msg}").unwrap());
+    search_pb.enable_steady_tick(std::time::Duration::from_millis(100));
+
+    for row in &rows {
+        search_pb.set_message(format!("searching '{}'...", row.prefix));
+        let docs = client.search_documents(&project, &row.prefix).await?;
+
+        for doc in &docs {
+            // Reliable .pdf filter (extension is trustworthy per project rules).
+            // to_ascii_lowercase makes it case-insensitive (.PDF, .Pdf).
+            let filename = doc.filename.as_deref().unwrap_or("");
+            if !filename.to_ascii_lowercase().ends_with(".pdf") {
+                continue;
+            }
+
+            // The key is the document_number verbatim — same string the manifest
+            // stored as `code`. No document_number → can't match a manifest
+            // entry, so skip.
+            let code = match doc.document_number.as_deref() {
+                Some(c) => c.to_string(),
+                None => continue,
+            };
+
+            // First result for a code wins; later duplicates (e.g. same doc
+            // caught by two prefixes) are ignored. or_insert_with only builds
+            // the SourceInfo when the entry is actually vacant.
+            by_code.entry(code).or_insert_with(|| SourceInfo {
+                revision: doc.revision.clone(),
+                document_id: doc.document_id.clone(),
+            });
+        }
+    }
+    search_pb.finish_and_clear();
+    println!("Indexed {} document(s) from Aconex.", by_code.len());
+
+    // --- Find the existing binders (same as update_from_folder) ----------
+    // Classify every PDF in binder_dir; keep only the ones marked as our binders
+    // (the classifier reads an Info-dict marker we embed at create time).
+    let binder_candidates = find_pdfs(&binder_dir);
+    let mut binders: Vec<PathBuf> = Vec::new();
+    for pdf in &binder_candidates {
+        if let crate::pdf_classifier::PdfKind::Binder { .. } =
+            crate::pdf_classifier::classify(pdf).kind
+        {
+            binders.push(pdf.clone());
+        }
+    }
+    if binders.is_empty() {
+        println!("No existing binders found in {}.", binder_dir.display());
+        return Ok(());
+    }
+    println!("\nFound {} binder(s) to check.", binders.len());
+
+    // --- Temp dir for changed downloads ----------------------------------
+    // Only CHANGED documents get downloaded, so this stays small. Auto-cleaned
+    // when _temp drops at function end (like a C# `using`).
+    let _temp = tempfile::tempdir().context("creating temp download folder")?;
+    let temp_path = _temp.path();
+
+    // --- Per-binder: rev-check, download changed, rebuild ----------------
+    let mut rebuilt = 0usize;
+    let mut unchanged = 0usize;
+
+    for binder in &binders {
+        let label = binder.file_name().and_then(|n| n.to_str()).unwrap_or("?");
+        println!("\nChecking: {}", label);
+
+        // Read the manifest. No manifest = not ours / pre-manifest; skip rather
+        // than error (same tolerance as the folder path).
+        let doc = match lopdf::Document::load(binder) {
+            Ok(d) => d,
+            Err(e) => {
+                println!("  Skipped — could not open ({e}).");
+                continue;
+            }
+        };
+        let json = match crate::xmp::read_manifest_json(&doc)? {
+            Some(j) => j,
+            None => {
+                println!("  Skipped — no paperclip manifest.");
+                continue;
+            }
+        };
+        let manifest = crate::manifest::BinderManifest::from_json(&json)
+            .with_context(|| format!("parsing manifest of {}", label))?;
+
+        // Build source_revisions for THIS binder's scope, in the shape
+        // check_binder wants: code -> Option<current revision>. We look each
+        // scoped code up in the global by_code map. Absent → left out → the
+        // checker treats it as a missing source (a warning, not a rebuild).
+        let mut source_revisions: HashMap<String, Option<String>> = HashMap::new();
+        for entry in &manifest.files {
+            if let Some(code) = entry.code.as_deref() {
+                if let Some(info) = by_code.get(code) {
+                    source_revisions.insert(code.to_string(), info.revision.clone());
+                }
+            }
+        }
+
+        // Shared rev-comparison core — identical call to the folder path. It
+        // compares each manifest entry's recorded revision against the current
+        // one and reports what changed / what's missing.
+        let report = crate::update_check::check_binder(&manifest, &source_revisions);
+
+        // Scoped documents with no current Aconex source — can't refresh; warn.
+        for code in &report.missing_sources {
+            println!("  Note: no Aconex source for {} — keeping existing version.", code);
+        }
+
+        // No changed revisions → nothing to rebuild. (Missing sources alone
+        // don't trigger a rebuild — there's nothing newer to pull in.)
+        if !report.needs_rebuild() {
+            println!("  Up to date.");
+            unchanged += 1;
+            continue;
+        }
+
+        for (code, old, new) in &report.changed {
+            println!("  Changed: {}  rev {} -> {}", code, old, new);
+        }
+
+        // Download ONLY the changed documents, building the new_sources map
+        // rebuild_in_place wants: code -> path of the freshly downloaded file.
+        let mut new_sources: HashMap<String, PathBuf> = HashMap::new();
+        for (code, _, _) in &report.changed {
+            // by_code is guaranteed to contain this code: it only became
+            // "changed" because check_binder found a source revision for it,
+            // which only happens when it's in by_code. Hence direct [code]
+            // indexing rather than .get() — the invariant rules out a panic.
+            let info = &by_code[code];
+
+            // Temp filename = document_id + .pdf. We deliberately do NOT use the
+            // Aconex upload name (it can be arbitrary, and could collide). The
+            // document_id is unique, so this can't clobber another download.
+            let dest = temp_path.join(format!("{}.pdf", info.document_id));
+
+            // Console label is the code (meaningful), not the temp filename.
+            println!("  Downloading {} ...", code);
+            client
+                .download_document(&project, &info.document_id, &dest)
+                .await
+                .with_context(|| format!("downloading {}", code))?;
+
+            new_sources.insert(code.clone(), dest);
+        }
+
+        // In-place rebuild — identical call to the folder path. Unchanged
+        // documents are carried over from the old binder's pages; changed ones
+        // come from new_sources. Scope (which documents) never changes.
+        crate::assembler::rebuild_in_place(
+            binder,
+            &manifest,
+            &new_sources,
+            code_pattern.as_ref(),
+        )
+        .with_context(|| format!("rebuilding {}", label))?;
+
+        println!("  Rebuilt.");
+        rebuilt += 1;
+    }
+
+    println!("\nUpdate complete: {} rebuilt, {} unchanged.", rebuilt, unchanged);
+    // _temp drops here → downloaded changed files are cleaned up.
     Ok(())
 }
 

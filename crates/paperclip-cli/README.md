@@ -79,6 +79,7 @@ crates/paperclip-cli/
 | `colored` | Coloured terminal output (flags, errors) |
 | `aconex` | The workspace's Aconex client library (path dependency) |
 | `tokio` | Async runtime — `main` is async to drive Aconex calls |
+| `tempfile` | Auto-cleaned temp dir for Aconex downloads (create/update aconex) |
 
 `serde`, `serde_json`, `anyhow`, `chrono`, and `uuid` are pulled from the
 workspace's shared dependency list; the rest are crate-local.
@@ -93,16 +94,20 @@ The `binder` command is a 2×2 of action × source:
 paperclip binder create folder            # build binders from PDFs in the working folder
 paperclip binder create aconex            # build binders from Aconex search results
 paperclip binder update folder [PATH]     # refresh binders from the working folder
-paperclip binder update aconex            # refresh binders from current Aconex revisions
+paperclip binder update aconex [PATH]     # refresh binders from current Aconex revisions
 ```
 
-**Working folder.** Source PDFs are always read from the directory you run
-paperclip in — run it from inside the project folder. `create folder` takes no
-path; `update folder` takes an optional PATH naming where the *binders* live
-(defaults to the working folder, alongside the sources).
+**Working folder.** Source PDFs (for the folder modes) are always read from the
+directory you run paperclip in — run it from inside the project folder. `create
+folder` takes no path; both `update folder` and `update aconex` take an optional
+PATH naming where the *binders* live (defaults to the working folder). For
+`update aconex` the sources come from Aconex rather than the folder, so PATH only
+locates the binders to refresh.
 
 **Create** builds binders fresh and writes them to the `output_folder` named in
-the mapper CSV.
+the mapper CSV. `create folder` uses local PDFs; `create aconex` searches Aconex
+once per mapper row (using `prefix` as the query), keeps the PDF results,
+downloads them to a temp folder, then runs the same match-and-assemble pipeline.
 
 **Update** reads each existing binder's embedded manifest, compares the revision
 of each contained document against the current source, and rebuilds in place only
@@ -114,11 +119,17 @@ across the rebuild.
 
 The rebuild loads the existing binder once and carries unchanged documents'
 pages straight from it (no need for their source files to be present), splicing
-in only the changed documents from the working folder. A document whose source is
-absent keeps its existing version, with a note.
+in only the changed documents from the source. A document whose source is absent
+keeps its existing version, with a note.
 
-> Note: `create aconex` and `update aconex` are not yet implemented — they print
-> a stub message. Folder create and folder update are fully working.
+For the **aconex** variants, the current revision of each document comes from the
+Aconex search result (`Document.revision`), not a local filename. `update aconex`
+searches every mapper row once, builds a `document_number → revision` index,
+rev-checks each binder against that index, and downloads **only** the documents
+whose revision changed — unchanged documents are never fetched. Downloads land in
+a temp folder that is auto-cleaned when the run ends. Documents are matched to the
+manifest purely by document number; the uploaded filename is used only to confirm
+the `.pdf` extension, never as a code or a name.
 
 ---
 
@@ -238,13 +249,20 @@ Quirks learned from the live API (also documented in the `aconex` crate):
 
 ### Binder commands
 - [x] `binder create folder` — assemble binders from the working folder via the mapper CSV
+- [x] `binder create aconex` — search Aconex per mapper row, download PDF results, assemble
 - [x] `binder update folder [PATH]` — rev-checked rebuild of existing binders, in place
+- [x] `binder update aconex [PATH]` — rev-checked rebuild from Aconex; downloads only changed documents
 - [x] Recursive PDF discovery (`walkdir`), parallel classification (`rayon`), progress bar
 - [x] Oversized-PDF guard (size check before parsing, default 500 MiB)
 - [x] Filenames parsed leniently and flagged (not skipped) when they don't match the convention
 - [x] Doc-number pattern configurable per project via `paperclip.toml`
 - [x] Update preserves scope, `binder_id`, and unchanged documents' metadata; loads the old binder once
-- [ ] `binder create aconex` / `binder update aconex` — planned (stubbed)
+
+### Aconex-sourced binders
+- [x] `create aconex` — per-row search, PDF-only filter, dedup by document id, collision-safe temp downloads
+- [x] `update aconex` — revision map built from `Document.revision` / `document_number`; changed-only downloads
+- [x] Both reuse the existing match/assemble and rev-check/rebuild pipelines (no duplicate assembly logic)
+- [x] Downloads land in an auto-cleaned temp folder (`tempfile`); matching is by document number, not filename
 
 ### Filename parser
 - [x] `parse_lenient` (best-effort): never fails; extracts what it can, reports a `flag_reason`
@@ -271,19 +289,24 @@ Quirks learned from the live API (also documented in the `aconex` crate):
 
 ## What is still to do
 
-### Aconex-sourced binders
-`create aconex` and `update aconex` are stubbed. They will mirror the folder
-modes: `create aconex` searches Aconex per mapper row, downloads the matched
-documents, and assembles; `update aconex` builds the revision map from the search
-results (`Document.revision` / `document_number`) instead of filenames, then
-reuses the same rev-check and in-place rebuild. The aconex paths will also route
-project/username through `project_config::resolve_config`.
-
 ### Existing-binder overwrite (create)
 A `create` run writes `{binder_name}.pdf` to the mapper's output folder, which
 overwrites any existing binder there. `update` is now the deliberate in-place
 refresh path; `create`'s overwrite behaviour is unchanged and still worth a guard
 (refuse / version / refresh) when a binder already exists.
+
+### New / removed documents on update
+Update deliberately fixes scope at creation: a source document with no matching
+manifest entry (a genuinely new drawing) and a manifest entry with no matching
+source (removed / superseded) are both left untouched — the second is reported as
+a missing source. If "scope drift" handling is ever wanted, it would be an opt-in
+on top of the current rev-only rule, for both folder and aconex update.
+
+### Filename collisions (create aconex)
+`create aconex` namespaces a second file that shares a filename with a different
+document (by prefixing its document id) and prints a note. A namespaced filename
+can then miss its mapper prefix in `match_pdfs`; if real collisions turn out to be
+common, matching would need to key on something other than the on-disk name.
 
 ### Folder-based binding (no mapper)
 When no mapper CSV is configured, offer to bind PDFs by folder (one binder per
@@ -305,6 +328,9 @@ pattern check, if still wanted, would build on that.
   a true single-document page-graph copy would be leaner for very large binders.
 - Oversized-PDF guard is a coarse file-size ceiling, not a streaming parse —
   legitimately large PDFs are skipped wholesale.
+- Aconex downloads run sequentially (one request at a time), matching the
+  client's request model. For binders with many changed documents this is the
+  slow path; it is intentional, not yet optimised.
 - Aconex XML parse failures currently surface as the `Http` error variant; a
   dedicated `Parse` variant is planned (see the `aconex` roadmap).
 - Colour output relies on the terminal honouring ANSI; old `cmd.exe` may print
@@ -325,7 +351,7 @@ paperclip config set --app-key           # prompts securely, no echo
 paperclip binder create folder
 paperclip binder create aconex
 paperclip binder update folder [path]
-paperclip binder update aconex
+paperclip binder update aconex [path]
 paperclip inspect <file.pdf>             # print a binder's manifest + rename check
 paperclip aconex projects                # list visible projects
 paperclip aconex project                 # resolve configured project → id

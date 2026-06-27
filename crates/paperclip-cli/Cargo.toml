@@ -1,6 +1,6 @@
 [package]
 name = "paperclip"
-version = "0.0.12"
+version = "0.1.0"
 edition = "2024"
 
 [dependencies]
@@ -31,6 +31,7 @@ flate2 = "1.1.9"
 # The new library crate. This is a path dependency, meaning it points to a local directory rather than a published crate on crates.io.
 aconex = { path = "../aconex" }
 tokio = { version = "1.52.3", features = ["full"] }
+tempfile = "3"   # auto-cleaned temp dir for Aconex downloads (deletes itself on drop)
 
 [dependencies.windows]
 version = "0.58"
