@@ -2,6 +2,14 @@
 // Merges source PDFs into a single binder PDF and attaches an XMP manifest
 // describing its contents. (Per-document cover pages were removed in favour
 // of the embedded manifest.)
+//
+// Two entry points:
+//   * assemble_all / assemble_one — CREATE: build binders fresh from source
+//     PDFs, driven by the mapper.
+//   * rebuild_in_place           — UPDATE: rebuild an existing binder from a
+//     mix of new source files (changed revisions) and pages carried over from
+//     the old binder (unchanged documents). No mapper; rebuilds in place.
+// Both share the lopdf page-merge core in `merge_documents`.
 
 use anyhow::{Context, Result};
 use lopdf::{dictionary, Document, Object, ObjectId};
@@ -14,6 +22,7 @@ pub fn assemble_all(
     binder_map: &HashMap<&String, Vec<&&PathBuf>>,
     rows: &[crate::mapper::MapperRow],
     run_log: &mut crate::log::RunLog,
+    code_pattern: Option<&regex::Regex>,
 ) -> Result<()> {
     let output_folder_map: HashMap<&str, &str> = rows
         .iter()
@@ -44,7 +53,7 @@ pub fn assemble_all(
             })
             .collect();
 
-        match assemble_one(binder_name, files, Path::new(output_folder), binder_rows) {
+        match assemble_one(binder_name, files, Path::new(output_folder), binder_rows, code_pattern) {
             Ok(output_path) => {
                 println!("{}", format!("  Written to: {}", output_path.display()).green());
             }
@@ -69,6 +78,7 @@ fn assemble_one(
     files: &[&&PathBuf],
     output_folder: &Path,
     mapper_rows: Vec<crate::manifest::MapperRow>,
+    code_pattern: Option<&regex::Regex>,
 ) -> Result<PathBuf> {
     // Sort files by filename ascending
     let mut sorted_files = files.to_vec();
@@ -100,7 +110,7 @@ fn assemble_one(
 
         // Lenient parse: never fails. Pulls out whatever it can and reports a
         // flag_reason for anything missing. Files are KEPT regardless now.
-        let parsed = crate::filename_parser::parse_lenient(stem);
+        let parsed = crate::filename_parser::parse_lenient(stem, code_pattern);
 
         let source_doc = Document::load(file.as_path())
             .with_context(|| format!("Failed to open: {}", filename))?;
@@ -141,7 +151,42 @@ fn assemble_one(
         current_page += source_page_count;
     }
 
-    // --- Merge all documents using the lopdf pattern from the docs -------
+    // Merge all collected source documents into one binder document.
+    let mut binder_doc = merge_documents(documents)?;
+
+    // --- Embed the fast-ID marker in the Info dict -----------------------
+    // The full data lives in the XMP manifest below; this Info-dict marker
+    // stays as a cheap "is this one of ours?" check for the classifier.
+    embed_marker(&mut binder_doc, binder_name);
+
+    // --- Build and attach the XMP manifest -------------------------------
+    let manifest = crate::manifest::BinderManifest::new(
+        binder_name,
+        mapper_rows,
+        file_entries,
+    );
+    let manifest_json = manifest.to_json()?;
+    crate::xmp::attach_manifest(&mut binder_doc, &manifest_json)
+        .context("Failed to attach manifest to binder")?;
+
+    // --- Write to disk ---------------------------------------------------
+    let output_path = output_folder.join(format!("{}.pdf", binder_name));
+    binder_doc.save(&output_path)
+        .with_context(|| format!("Failed to write binder: {}", output_path.display()))?;
+
+    Ok(output_path)
+}
+
+// --- Shared page-merge core ----------------------------------------------
+
+/// Merges an ordered list of `Document`s into one binder `Document` (no marker,
+/// no manifest, no save — just the page merge). Shared by create
+/// (`assemble_one`) and update (`rebuild_in_place`). Pages come out in the
+/// order the input Vec gives them.
+///
+/// This is the lopdf merge pattern from the lopdf docs, kept in ONE place so
+/// both callers share the tricky object-renumbering logic.
+fn merge_documents(documents: Vec<Document>) -> Result<Document> {
     let mut max_id = 1;
     let mut documents_pages: BTreeMap<ObjectId, Object> = BTreeMap::new();
     let mut documents_objects: BTreeMap<ObjectId, Object> = BTreeMap::new();
@@ -234,27 +279,184 @@ fn assemble_one(
     binder_doc.renumber_objects();
     binder_doc.adjust_zero_pages();
 
-    // --- Embed the fast-ID marker in the Info dict -----------------------
-    // The full data lives in the XMP manifest below; this Info-dict marker
-    // stays as a cheap "is this one of ours?" check for the classifier.
-    embed_marker(&mut binder_doc, binder_name);
+    Ok(binder_doc)
+}
 
-    // --- Build and attach the XMP manifest -------------------------------
-    let manifest = crate::manifest::BinderManifest::new(
-        binder_name,
-        mapper_rows,
+// --- Update: rebuild in place --------------------------------------------
+
+/// Rebuilds an existing binder in place from mixed page sources, loading the
+/// old binder only ONCE.
+///
+/// Walks the binder's manifest scope in recorded order. For each document:
+///   * changed (a file for its `code` is in `new_sources`): the new file's
+///     pages are used, with fresh metadata.
+///   * unchanged: its existing pages are taken from the old binder. To avoid
+///     re-reading the (possibly large) binder per document, we load it once and
+///     CLONE-and-trim that in-memory copy per contiguous RUN of unchanged
+///     documents — cloning is a memory copy, not a PDF re-parse.
+///
+/// Page ranges for the NEW manifest are computed in this single forward pass
+/// from known lengths — for unchanged docs the length comes straight from the
+/// old manifest (end - start + 1), for changed docs from the new file's page
+/// count. No post-merge recomputation is needed.
+///
+/// The rebuilt binder keeps the original `binder_id`; unchanged documents keep
+/// their original metadata (added_utc, revision), changed documents get fresh
+/// entries.
+///
+/// `binder_path` is both read source (old pages) and write target (in place).
+/// `new_sources` maps a document `code` to the path of its new-revision file.
+pub fn rebuild_in_place(
+    binder_path: &Path,
+    old_manifest: &crate::manifest::BinderManifest,
+    new_sources: &HashMap<String, PathBuf>,
+    code_pattern: Option<&regex::Regex>,
+) -> Result<()> {
+    // Load the old binder ONCE. All unchanged pages come from clones of this.
+    let old_binder = Document::load(binder_path)
+        .with_context(|| format!("Failed to open binder: {}", binder_path.display()))?;
+
+    // The ordered list of documents to merge, and the matching manifest entries.
+    let mut documents: Vec<Document> = Vec::new();
+    let mut file_entries: Vec<crate::manifest::FileEntry> = Vec::new();
+
+    // 1-based running page counter in the REBUILT binder. Each document, new or
+    // carried-over, advances it by its own page count — this is what gives every
+    // entry a correct start/end without any second pass.
+    let mut current_page: u32 = 1;
+
+    // Accumulator for a contiguous run of UNCHANGED documents. We collect their
+    // old-binder page span so the whole run is extracted in ONE clone-and-trim,
+    // while still recording each document's own range from manifest arithmetic.
+    let mut run_old_start: Option<u32> = None; // first old-binder page of the run
+    let mut run_old_end: u32 = 0;              // last old-binder page of the run
+
+    for entry in &old_manifest.files {
+        let new_file = entry
+            .code
+            .as_deref()
+            .and_then(|code| new_sources.get(code));
+
+        match new_file {
+            // --- changed: flush any pending unchanged run, then add new file -
+            Some(path) => {
+                flush_unchanged_run(
+                    &old_binder,
+                    &mut run_old_start,
+                    run_old_end,
+                    &mut documents,
+                );
+
+                let doc = Document::load(path)
+                    .with_context(|| format!("Failed to open new source: {}", path.display()))?;
+                let page_count = doc.get_pages().len() as u32;
+
+                let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
+                let parsed = crate::filename_parser::parse_lenient(stem, code_pattern);
+
+                let start_page = current_page;
+                let end_page = start_page + page_count - 1;
+                current_page += page_count;
+
+                println!(
+                    "  Updating: {} -> rev {} (pages {}–{})",
+                    path.file_name().and_then(|n| n.to_str()).unwrap_or("unknown"),
+                    parsed.revision.as_deref().unwrap_or("?"),
+                    start_page, end_page
+                );
+
+                documents.push(doc);
+                file_entries.push(crate::manifest::FileEntry {
+                    filename: path.file_name().and_then(|n| n.to_str()).unwrap_or("unknown").to_string(),
+                    code: parsed.code,
+                    revision: parsed.revision,
+                    name: parsed.name,
+                    start_page,
+                    end_page,
+                    added_utc: chrono::Utc::now().to_rfc3339(), // entered now
+                    flag_reason: parsed.flag_reason,
+                });
+            }
+            // --- unchanged: extend the run, record this doc's new range -----
+            None => {
+                // Length of this document in the OLD binder, straight from its
+                // recorded span. We trust the manifest's page map here.
+                let page_count = entry.end_page - entry.start_page + 1;
+
+                // Extend the old-binder run span so the flush extracts it all.
+                if run_old_start.is_none() {
+                    run_old_start = Some(entry.start_page);
+                }
+                run_old_end = entry.end_page;
+
+                // This document's range in the REBUILT binder.
+                let start_page = current_page;
+                let end_page = start_page + page_count - 1;
+                current_page += page_count;
+
+                file_entries.push(crate::manifest::FileEntry {
+                    filename: entry.filename.clone(),
+                    code: entry.code.clone(),
+                    revision: entry.revision.clone(),
+                    name: entry.name.clone(),
+                    start_page,
+                    end_page,
+                    added_utc: entry.added_utc.clone(), // preserved
+                    flag_reason: entry.flag_reason.clone(),
+                });
+            }
+        }
+    }
+
+    // Flush a trailing unchanged run, if the scope ended on unchanged docs.
+    flush_unchanged_run(&old_binder, &mut run_old_start, run_old_end, &mut documents);
+
+    // Merge new files + extracted unchanged runs, in order.
+    let mut binder_doc = merge_documents(documents)?;
+
+    // Re-embed marker + fresh manifest with the SAME binder_id.
+    embed_marker(&mut binder_doc, &old_manifest.binder_name);
+
+    let mut manifest = crate::manifest::BinderManifest::new(
+        &old_manifest.binder_name,
+        old_manifest.mapper_rows.clone(),
         file_entries,
     );
+    manifest.binder_id = old_manifest.binder_id.clone(); // identity survives
+
     let manifest_json = manifest.to_json()?;
     crate::xmp::attach_manifest(&mut binder_doc, &manifest_json)
-        .context("Failed to attach manifest to binder")?;
+        .context("Failed to attach manifest to rebuilt binder")?;
 
-    // --- Write to disk ---------------------------------------------------
-    let output_path = output_folder.join(format!("{}.pdf", binder_name));
-    binder_doc.save(&output_path)
-        .with_context(|| format!("Failed to write binder: {}", output_path.display()))?;
+    binder_doc.save(binder_path)
+        .with_context(|| format!("Failed to write rebuilt binder: {}", binder_path.display()))?;
 
-    Ok(output_path)
+    Ok(())
+}
+
+/// Extracts a pending run of unchanged pages [run_old_start, run_old_end] from
+/// the already-loaded old binder by CLONING it (memory copy) and deleting every
+/// page outside the run. Pushes the result onto `documents` and clears the run.
+/// A no-op if no run is pending (run_old_start is None).
+fn flush_unchanged_run(
+    old_binder: &Document,
+    run_old_start: &mut Option<u32>,
+    run_old_end: u32,
+    documents: &mut Vec<Document>,
+) {
+    let start = match run_old_start.take() {
+        Some(s) => s,
+        None => return,
+    };
+
+    let mut chunk = old_binder.clone();
+    let total = chunk.get_pages().len() as u32;
+    let to_delete: Vec<u32> = (1..=total)
+        .filter(|p| *p < start || *p > run_old_end)
+        .collect();
+    chunk.delete_pages(&to_delete);
+
+    documents.push(chunk);
 }
 
 /// Embeds the BinderTool marker into the document Info dictionary.

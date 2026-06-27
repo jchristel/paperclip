@@ -13,6 +13,8 @@ mod inspect;
 mod assembler;
 mod aconex_cmd;
 mod aconex_diag;
+mod project_config;
+mod update_check;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
@@ -69,31 +71,46 @@ enum Commands {
 // `create` builds new binder PDFs. `update` rebuilds only where the source
 // revision differs from what's recorded in the existing binder's manifest
 // (the rev check lives in the update path, and applies to BOTH sources).
-
 #[derive(Subcommand)]
 enum BinderAction {
     /// Create new binders from a source
     Create {
         #[command(subcommand)]
-        source: BinderSource,
+        source: CreateSource,
     },
     /// Update existing binders where the source revision has changed
     Update {
         #[command(subcommand)]
-        source: BinderSource,
+        source: UpdateSource,
     },
 }
 
+// Create and Update have SEPARATE source enums because their `folder` source
+// differs: create always operates on the current working folder (no path),
+// whereas update takes an optional PATH naming where the BINDERS live (source
+// PDFs are always read from the working folder). Splitting the enums keeps
+// `--help` honest — create doesn't advertise a PATH it ignores.
+
 #[derive(Subcommand)]
-enum BinderSource {
-    /// Use PDFs found in a local folder, matched to binders via the mapper CSV
+enum CreateSource {
+    /// Build binders from the PDFs in the current working folder, matched via
+    /// the mapper CSV. Run paperclip from the folder containing the sources.
+    Folder,
+    /// Build binders from documents fetched from Aconex, one search per row
+    Aconex,
+}
+
+#[derive(Subcommand)]
+enum UpdateSource {
+    /// Refresh existing binders where a source document's revision has changed.
+    /// Source PDFs are read from the current working folder; PATH optionally
+    /// says where the binders to refresh live (defaults to the working folder).
     Folder {
-        /// Folder to scan for PDFs. If omitted, uses the current directory
-        /// (the folder paperclip was invoked from) — the behaviour the old
-        /// bare `paperclip binder` had.
+        /// Folder containing the binders to update. If omitted, the binders are
+        /// assumed to be in the current working folder alongside the sources.
         path: Option<String>,
     },
-    /// Use documents fetched from Aconex, one search per mapper row
+    /// Refresh existing binders against current Aconex revisions
     Aconex,
 }
 
@@ -265,18 +282,18 @@ async fn main() -> Result<()> {
         },
         Commands::Binder { action } => match action {
             BinderAction::Create { source } => match source {
-                BinderSource::Folder { path } => {
-                    binder::create_from_folder(path.as_deref())?;
+                CreateSource::Folder => {
+                    binder::create_from_folder()?;
                 }
-                BinderSource::Aconex => {
+                CreateSource::Aconex => {
                     binder::create_from_aconex()?;
                 }
             },
             BinderAction::Update { source } => match source {
-                BinderSource::Folder { path } => {
+                UpdateSource::Folder { path } => {
                     binder::update_from_folder(path.as_deref())?;
                 }
-                BinderSource::Aconex => {
+                UpdateSource::Aconex => {
                     binder::update_from_aconex()?;
                 }
             },

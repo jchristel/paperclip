@@ -72,7 +72,7 @@ pub struct FileEntry {
 /// binder is self-describing — you can see how it was built without the
 /// original CSV. Mirrors crate::mapper::MapperRow but lives here so the
 /// manifest module has no dependency on the mapper module's internals.
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct MapperRow {
     pub prefix: String,
     pub binder_name: String,

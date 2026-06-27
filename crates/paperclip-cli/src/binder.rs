@@ -1,29 +1,38 @@
 // src/binder.rs
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use indicatif::{ProgressBar, ProgressStyle};
 use std::path::{Path, PathBuf};
 use walkdir::WalkDir;
 use rayon::prelude::*;   // brings par_iter() into scope, like `using System.Linq;` for PLINQ
+use regex::Regex;
 
 /// `binder create folder [PATH]` — scan a folder for PDFs and assemble binders
-/// via the mapper CSV. This is the old `run()` body, now parameterised by the
-/// folder to scan.
-///
-/// `folder` is the optional PATH from the CLI. `None` means "use the current
-/// directory" — the behaviour bare `paperclip binder` had. We resolve it once
-/// here into `scan_dir` and use that for both the PDF scan AND the log
-/// location, so a custom folder keeps its log alongside its files.
-pub fn create_from_folder(folder: Option<&str>) -> Result<()> {
-    // Resolve the scan directory: the supplied path, or the current dir.
-    // `map(PathBuf::from)` turns Option<&str> into Option<PathBuf>; if it's
-    // None we fall back to current_dir(). The `?` handles the (rare) case
-    // where the current dir can't be read.
-    let scan_dir = match folder {
-        Some(p) => PathBuf::from(p),
-        None => std::env::current_dir()?,
-    };
+/// via the mapper CSV. 
+pub fn create_from_folder() -> Result<()> {
+    // Source PDFs are always read from the current working folder — you run
+    // paperclip from inside the project folder. This keeps create and update
+    // consistent: both treat the working folder as the source of truth.
+    let scan_dir = std::env::current_dir()?;
     println!("Scanning for PDFs in: {}", scan_dir.display());
+
+    // Resolve effective config: global (settings.toml) with an optional
+    // paperclip.toml in THIS folder layered on top. The project file is where
+    // the mapper, doc-number pattern, and project name come from per-project.
+    let config = crate::project_config::resolve_config(&scan_dir)?;
+
+    // Compile the doc-number pattern up front, so a typo'd mask stops the run
+    // immediately with a clear message rather than flagging every single file.
+    // `None` if no pattern is configured — parse_lenient then uses its default
+    // 5-part code regex. `map_err` turns the compiler's plain-String error into
+    // an anyhow error with context (the `?` then propagates it out of the run).
+    let code_pattern = match config.doc_number_pattern.as_deref() {
+        Some(mask) => Some(
+            crate::filename_parser::compile_doc_number_mask(mask)
+                .map_err(|e| anyhow::anyhow!("invalid document-number pattern: {e}"))?,
+        ),
+        None => None,
+    };
 
     let pdfs = find_pdfs(&scan_dir);
 
@@ -150,24 +159,25 @@ pub fn create_from_folder(folder: Option<&str>) -> Result<()> {
     }
 
     // --- Mapper check ----------------------------------------------------
-    let config = crate::settings::load()?;
-
-    match config.mapper_csv_path {
+    // `config` was resolved at the top of the function; reuse it here (don't
+    // reload). mapper_csv_path is now a PathBuf (resolved relative to the
+    // paperclip.toml when it came from there).
+    match config.mapper_csv_path.as_ref() {
         None => {
             // No mapper configured at all
             handle_no_mapper(&regular_pdfs)?;
         }
-        Some(ref path) => {
-            let mapper_path = std::path::Path::new(path);
+        Some(mapper_path) => {
             if !mapper_path.exists() {
                 // Path is configured but file is gone
                 println!("\nWarning: Mapper file configured but not found at:");
-                println!("  {}", path);
-                println!("Run `paperclip config set --mapper-path` to update it.");
+                println!("  {}", mapper_path.display());
+                println!("Set `mapper` in paperclip.toml or run `paperclip config set --mapper-path`.");
                 handle_no_mapper(&regular_pdfs)?;
             } else {
-                // Mapper exists — read and validate it
-                handle_mapper(mapper_path, &regular_pdfs, &mut run_log)?;
+                // Mapper exists — read and validate it. Pass the compiled
+                // doc-number pattern through for filename validation.
+                handle_mapper(mapper_path, &regular_pdfs, &mut run_log, code_pattern.as_ref())?;
             }
         }
     }
@@ -193,17 +203,176 @@ pub fn create_from_aconex() -> Result<()> {
     Ok(())
 }
 
-/// `binder update folder [PATH]` — rebuild only where the revision changed.
+/// `binder update folder [PATH]` — refresh existing binders where a source
+/// document's revision has changed.
 ///
-/// Same as create_from_folder, but before assembling a binder:
-///   - read the existing binder PDF's manifest (xmp::read_manifest_json)
-///   - compare each source file's revision (filename_parser) against the
-///     revision recorded for that file in the manifest
-///   - rebuild only if any differ (or a file is new/removed); otherwise skip
-/// TODO: define the exact "changed" rule (any file differs → rebuild whole
-///       binder? per-file replace?). Start with whole-binder rebuild.
-pub fn update_from_folder(_folder: Option<&str>) -> Result<()> {
-    println!("[stub] binder update folder — not yet implemented");
+/// Source PDFs are read from the current working folder. `binder_path` says
+/// where the binders to update live; `None` means they're in the working folder
+/// alongside the sources.
+///
+/// Flow:
+///   1. Scan + classify the working folder (gives current source PDFs).
+///   2. Scan the binder folder for existing binders.
+///   3. For each binder: read its manifest, build a code→newfile map from the
+///      current sources whose revision differs, and if any differ, rebuild it
+///      in place via the assembler.
+/// Scope is fixed at creation — update never adds or removes documents.
+pub fn update_from_folder(binder_path: Option<&str>) -> Result<()> {
+    use std::collections::HashMap;
+
+    // Sources always come from the working folder; that's also where
+    // paperclip.toml (mapper/pattern) lives.
+    let work_dir = std::env::current_dir()?;
+    let binder_dir = match binder_path {
+        Some(p) => PathBuf::from(p),
+        None => work_dir.clone(),
+    };
+
+    println!("Source PDFs from: {}", work_dir.display());
+    println!("Binders in:       {}", binder_dir.display());
+
+    // Resolve config + compile the doc-number pattern, same as create. A typo'd
+    // pattern stops the run up front rather than mis-parsing every source.
+    let config = crate::project_config::resolve_config(&work_dir)?;
+    let code_pattern = match config.doc_number_pattern.as_deref() {
+        Some(mask) => Some(
+            crate::filename_parser::compile_doc_number_mask(mask)
+                .map_err(|e| anyhow::anyhow!("invalid document-number pattern: {e}"))?,
+        ),
+        None => None,
+    };
+
+    // --- 1. Find the current source PDFs in the working folder -----------
+    // We only need REGULAR pdfs as sources; classify also tells us which are
+    // themselves binders (skipped as sources).
+    let source_pdfs = find_pdfs(&work_dir);
+    if source_pdfs.is_empty() {
+        println!("No source PDFs found in the working folder. Nothing to update from.");
+        return Ok(());
+    }
+
+    // Build a code -> path map of the current sources. Parse each filename for
+    // its code; sources without a parseable code can't be matched and are
+    // skipped (they could never line up with a manifest entry).
+    let mut sources_by_code: HashMap<String, PathBuf> = HashMap::new();
+    for pdf in &source_pdfs {
+        let stem = pdf.file_stem().and_then(|s| s.to_str()).unwrap_or("");
+        let parsed = crate::filename_parser::parse_lenient(stem, code_pattern.as_ref());
+        if let Some(code) = parsed.code {
+            // Last-write-wins if two sources share a code; unusual, but we don't
+            // try to resolve it here.
+            sources_by_code.insert(code, pdf.clone());
+        }
+    }
+
+    // --- 2. Find the existing binders in the binder folder ---------------
+    // Classify the binder folder's PDFs and keep only the ones marked as our
+    // binders (via the Info-dict marker the classifier reads).
+    let binder_candidates = find_pdfs(&binder_dir);
+    let mut binders: Vec<PathBuf> = Vec::new();
+    for pdf in &binder_candidates {
+        match crate::pdf_classifier::classify(pdf).kind {
+            crate::pdf_classifier::PdfKind::Binder { .. } => binders.push(pdf.clone()),
+            _ => {} // regular/unreadable/too-large: not a binder to update
+        }
+    }
+
+    if binders.is_empty() {
+        println!("No existing binders found in {}.", binder_dir.display());
+        return Ok(());
+    }
+
+    println!("\nFound {} binder(s) to check.", binders.len());
+
+    // --- 3. Check each binder and rebuild the stale ones -----------------
+    let mut rebuilt = 0usize;
+    let mut unchanged = 0usize;
+
+    for binder in &binders {
+        let label = binder.file_name().and_then(|n| n.to_str()).unwrap_or("?");
+        println!("\nChecking: {}", label);
+
+        // Read the binder's manifest. No manifest = not ours / pre-manifest;
+        // skip it rather than error.
+        let doc = match lopdf::Document::load(binder) {
+            Ok(d) => d,
+            Err(e) => {
+                println!("  Skipped — could not open ({e}).");
+                continue;
+            }
+        };
+        let json = match crate::xmp::read_manifest_json(&doc)? {
+            Some(j) => j,
+            None => {
+                println!("  Skipped — no paperclip manifest.");
+                continue;
+            }
+        };
+        let manifest = crate::manifest::BinderManifest::from_json(&json)
+            .with_context(|| format!("parsing manifest of {}", label))?;
+
+        // Build the code -> current revision map for THIS binder's scope only:
+        // for each scoped document, what revision is present in the sources now?
+        let mut source_revisions: HashMap<String, Option<String>> = HashMap::new();
+        for entry in &manifest.files {
+            if let Some(code) = entry.code.as_deref() {
+                if let Some(path) = sources_by_code.get(code) {
+                    let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
+                    let parsed = crate::filename_parser::parse_lenient(stem, code_pattern.as_ref());
+                    source_revisions.insert(code.to_string(), parsed.revision);
+                }
+                // No source for this code → simply absent from the map, which
+                // check_binder reads as "missing source" (a warning, not a
+                // rebuild).
+            }
+        }
+
+        // Rev-check: which scoped documents changed?
+        let report = crate::update_check::check_binder(&manifest, &source_revisions);
+
+        // Report missing sources (scoped docs with no current source).
+        for code in &report.missing_sources {
+            println!("  Note: no source present for {} — keeping existing version.", code);
+        }
+
+        if !report.needs_rebuild() {
+            println!("  Up to date.");
+            unchanged += 1;
+            continue;
+        }
+
+        // Announce what's changing.
+        for (code, old, new) in &report.changed {
+            println!("  Changed: {}  rev {} -> {}", code, old, new);
+        }
+
+        // Build the new_sources map (code -> new file path) for only the
+        // changed documents — that's what rebuild_in_place swaps in.
+        let mut new_sources: HashMap<String, PathBuf> = HashMap::new();
+        for (code, _, _) in &report.changed {
+            if let Some(path) = sources_by_code.get(code) {
+                new_sources.insert(code.clone(), path.clone());
+            }
+        }
+
+        // Rebuild in place.
+        crate::assembler::rebuild_in_place(
+            binder,
+            &manifest,
+            &new_sources,
+            code_pattern.as_ref(),
+        )
+        .with_context(|| format!("rebuilding {}", label))?;
+
+        println!("  Rebuilt.");
+        rebuilt += 1;
+    }
+
+    println!(
+        "\nUpdate complete: {} rebuilt, {} unchanged.",
+        rebuilt, unchanged
+    );
+
     Ok(())
 }
 
@@ -256,6 +425,7 @@ fn handle_mapper(
     mapper_path: &std::path::Path,
     regular_pdfs: &[PathBuf],
     run_log: &mut crate::log::RunLog,
+    code_pattern: Option<&Regex>,
 ) -> Result<()> {
     println!("\nMapper file found: {}", mapper_path.display());
 
@@ -298,7 +468,10 @@ fn handle_mapper(
 
         // Lenient parse never errors; flag_reason is Some(..) when something
         // didn't match the naming convention.
-        let parsed = crate::filename_parser::parse_lenient(stem);
+        // `None` for now → uses the default 5-part code regex. Once the
+        // paperclip.toml doc-number pattern is loaded, the compiled Regex
+        // gets threaded through to here as Some(&pattern).
+        let parsed = crate::filename_parser::parse_lenient(stem, code_pattern);
 
         if let Some(reason) = &parsed.flag_reason {
             let filename = pdf.file_name()
@@ -358,7 +531,7 @@ fn handle_mapper(
 
     // --- Assemble binders ------------------------------------------------
     if !filtered_binder_map.is_empty() {
-        crate::assembler::assemble_all(&filtered_binder_map, &rows, run_log)?;
+        crate::assembler::assemble_all(&filtered_binder_map, &rows, run_log, code_pattern)?;
     }
 
     Ok(())
@@ -373,7 +546,7 @@ fn handle_mapper(
 ///   C#:     Directory.EnumerateFiles(root, "*", SearchOption.AllDirectories)
 ///   Python: os.walk(root)
 fn find_pdfs(root: &Path) -> Vec<PathBuf> {
-    let mut results: Vec<PathBuf> = WalkDir::new(root)
+    let results: Vec<PathBuf> = WalkDir::new(root)
         .into_iter()                       // turn the WalkDir into an iterator of entries
         .filter_map(|entry| entry.ok())    // skip any entry we couldn't read (permissions, etc.)
                                            //   instead of crashing — like the old `match … Err => return`
