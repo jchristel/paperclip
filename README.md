@@ -71,11 +71,3 @@ Copies `paperclip.exe` to a per-user location and adds it to the user `PATH`
   document search. Built on `reqwest` + `tokio` + `quick-xml`.
 
 See each crate's README for the detailed progress tracker.
-
-## A note on the relationship to the original Python
-
-The `aconex` crate is a clean-room reimplementation of an existing Python
-library, deliberately restructured (split modules, typed structs, an error
-enum, the builder/trait patterns) rather than transliterated. Endpoint URLs,
-rate limits, and similar facts about the Aconex API are reproduced because they
-are facts about the service, not creative expression.
